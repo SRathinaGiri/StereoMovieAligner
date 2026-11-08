@@ -1,0 +1,10 @@
+/build*/
+/dist/
+/.qt/
+*.user
+*.autosave
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.log
