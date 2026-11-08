@@ -14,6 +14,7 @@ Stereo Aligner is a Qt 6 Widgets application for synchronizing and aligning two 
 - SIFT/RANSAC automatic alignment, inspired by the Autopano-Sift workflow historically used by StereoPhoto Maker. It analyzes three nearby frame pairs and offers zoom-only or zoom-plus-X/Y correction with a confidence report.
 - Shared left, right, top and bottom cropping for both eyes, with automatic removal of black borders after auto alignment.
 - Automatic RGB color-balance and contrast matching using either the left or right selected frame as the reference; the correction is included in previews and export.
+- Save and reopen portable JSON projects containing both video paths, selected frames, transforms, crop, color correction and interface/output choices.
 - Side-by-side, red/cyan anaglyph, and difference previews.
 - Light and dark themes, with light selected by default.
 - English/US number formatting independent of Windows regional settings.
@@ -49,5 +50,7 @@ To make a portable folder, run `windeployqt` on the resulting executable and inc
 6. Fine-tune horizontal, vertical and zoom values manually if needed. Hold `Shift` while using alignment shortcuts for 10-pixel steps.
 7. Select an output format and audio source.
 8. Click **Export from selected frames**. The current left and right frames become time zero in the output.
+
+Use **Save JSON** (`Ctrl+S`) to preserve the complete working state. **Open JSON** (`Ctrl+O`) restores it later. Video paths are stored both relative to the project file and as an absolute fallback, so a project can be moved together with its source videos.
 
 The source videos are never modified.

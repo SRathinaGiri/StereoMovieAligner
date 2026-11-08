@@ -134,6 +134,7 @@ private:
     EyeControls rightUi;
     ColorCorrection leftColor;
     ColorCorrection rightColor;
+    QString projectPath;
     QString ffmpegPath;
 
     QLabel *leftPreview = nullptr;
@@ -145,6 +146,8 @@ private:
     QComboBox *outputMode = nullptr;
     QComboBox *audioSource = nullptr;
     QCheckBox *linkStepping = nullptr;
+    QPushButton *openProjectButton = nullptr;
+    QPushButton *saveProjectButton = nullptr;
     QPushButton *resetAlignment = nullptr;
     QPushButton *autoAlignButton = nullptr;
     QSpinBox *cropLeft = nullptr;
@@ -306,6 +309,17 @@ private:
         subtitle->setWordWrap(true);
         drawerLayout->addWidget(title);
         drawerLayout->addWidget(subtitle);
+
+        auto *projectGroup = new QGroupBox("Project");
+        auto *projectLayout = new QHBoxLayout(projectGroup);
+        openProjectButton = new QPushButton("Open JSON…");
+        saveProjectButton = new QPushButton("Save JSON…");
+        openProjectButton->setToolTip("Open a saved Stereo Aligner project.");
+        saveProjectButton->setToolTip("Save video paths and all current alignment settings as JSON.");
+        projectLayout->addWidget(openProjectButton);
+        projectLayout->addWidget(saveProjectButton);
+        drawerLayout->addWidget(projectGroup);
+
         drawerLayout->addWidget(makeFileCard(true));
         drawerLayout->addWidget(makeFileCard(false));
         drawerLayout->addWidget(makeTimelineCard(true));
@@ -430,12 +444,17 @@ private:
         drawerAction->setToolTip("Show or hide controls");
         rail->addAction(drawerAction);
         rail->addSeparator();
+        QAction *openProjectAction = rail->addAction(style()->standardIcon(QStyle::SP_DialogOpenButton), "Open JSON project");
+        QAction *saveProjectAction = rail->addAction(style()->standardIcon(QStyle::SP_DialogSaveButton), "Save JSON project");
+        rail->addSeparator();
         QAction *openLeftAction = rail->addAction(style()->standardIcon(QStyle::SP_DialogOpenButton), "Open left video");
         QAction *openRightAction = rail->addAction(style()->standardIcon(QStyle::SP_DirOpenIcon), "Open right video");
         rail->addSeparator();
         QAction *exportAction = rail->addAction(style()->standardIcon(QStyle::SP_DialogSaveButton), "Export aligned video");
         connect(openLeftAction, &QAction::triggered, this, [this] { chooseVideo(true); });
         connect(openRightAction, &QAction::triggered, this, [this] { chooseVideo(false); });
+        connect(openProjectAction, &QAction::triggered, this, [this] { openProject(); });
+        connect(saveProjectAction, &QAction::triggered, this, [this] { saveProject(); });
         connect(exportAction, &QAction::triggered, this, [this] { startExport(); });
     }
 
@@ -527,6 +546,8 @@ private:
 
     void connectUi()
     {
+        connect(openProjectButton, &QPushButton::clicked, this, [this] { openProject(); });
+        connect(saveProjectButton, &QPushButton::clicked, this, [this] { saveProject(); });
         connect(leftUi.open, &QPushButton::clicked, this, [this] { chooseVideo(true); });
         connect(rightUi.open, &QPushButton::clicked, this, [this] { chooseVideo(false); });
         connect(leftUi.previous, &QPushButton::clicked, this, [this] { stepFrame(true, -1); });
@@ -582,6 +603,8 @@ private:
         addShortcut(QKeySequence(Qt::Key_D), [this] { stepFrame(true, 1, false); });
         addShortcut(QKeySequence(Qt::Key_J), [this] { stepFrame(false, -1, false); });
         addShortcut(QKeySequence(Qt::Key_L), [this] { stepFrame(false, 1, false); });
+        addShortcut(QKeySequence::Open, [this] { openProject(); });
+        addShortcut(QKeySequence::Save, [this] { saveProject(); });
         addAlignmentShortcuts();
     }
 
@@ -621,6 +644,188 @@ private:
         addShortcut(QKeySequence("Alt+Shift+Right"), [=] { nudge(rightUi.x, 10); });
         addShortcut(QKeySequence("Alt+Shift+Up"), [=] { nudge(rightUi.y, -10); });
         addShortcut(QKeySequence("Alt+Shift+Down"), [=] { nudge(rightUi.y, 10); });
+    }
+
+    static QJsonObject colorToJson(const ColorCorrection &correction)
+    {
+        QJsonArray gain;
+        QJsonArray offset;
+        for (int channel = 0; channel < 3; ++channel) {
+            gain.append(correction.gain[channel]);
+            offset.append(correction.offset[channel]);
+        }
+        return {{"gain", gain}, {"offset", offset}};
+    }
+
+    static ColorCorrection colorFromJson(const QJsonObject &object)
+    {
+        ColorCorrection correction;
+        const QJsonArray gain = object.value("gain").toArray();
+        const QJsonArray offset = object.value("offset").toArray();
+        if (gain.size() != 3 || offset.size() != 3) return correction;
+        for (int channel = 0; channel < 3; ++channel) {
+            correction.gain[channel] = qBound(0.1, gain.at(channel).toDouble(1.0), 4.0);
+            correction.offset[channel] = qBound(-255.0, offset.at(channel).toDouble(0.0), 255.0);
+        }
+        return correction;
+    }
+
+    static QString storedVideoPath(const QString &videoPath, const QDir &projectDirectory)
+    {
+        const QString relative = projectDirectory.relativeFilePath(QFileInfo(videoPath).absoluteFilePath());
+        return QDir::fromNativeSeparators(relative);
+    }
+
+    static QString resolvedVideoPath(const QJsonObject &eye, const QDir &projectDirectory)
+    {
+        const QString stored = eye.value("path").toString();
+        if (!stored.isEmpty()) {
+            const QString candidate = QFileInfo(stored).isAbsolute()
+                ? stored : projectDirectory.absoluteFilePath(stored);
+            if (QFileInfo::exists(candidate)) return QFileInfo(candidate).absoluteFilePath();
+        }
+        const QString absolute = eye.value("absolutePath").toString();
+        if (QFileInfo::exists(absolute)) return QFileInfo(absolute).absoluteFilePath();
+        return {};
+    }
+
+    QJsonObject eyeToJson(const VideoInfo &info, const EyeControls &ui,
+                          const ColorCorrection &color, const QDir &projectDirectory) const
+    {
+        return {
+            {"path", storedVideoPath(info.path, projectDirectory)},
+            {"absolutePath", QDir::fromNativeSeparators(QFileInfo(info.path).absoluteFilePath())},
+            {"frame", ui.frame->value()},
+            {"x", ui.x->value()},
+            {"y", ui.y->value()},
+            {"zoomPercent", ui.zoom->value()},
+            {"color", colorToJson(color)}
+        };
+    }
+
+    void saveProject()
+    {
+        if (!leftInfo.valid() || !rightInfo.valid()) {
+            QMessageBox::information(this, "Load both videos",
+                                     "Load both the left and right videos before saving a project.");
+            return;
+        }
+        QString suggested;
+        if (!projectPath.isEmpty()) suggested = projectPath;
+        else suggested = QFileInfo(leftInfo.path).dir().filePath(
+            QFileInfo(leftInfo.path).completeBaseName() + "_StereoAligner.json");
+        QString path = QFileDialog::getSaveFileName(this, "Save Stereo Aligner project", suggested,
+                                                    "Stereo Aligner project (*.json)");
+        if (path.isEmpty()) return;
+        if (QFileInfo(path).suffix().isEmpty()) path += ".json";
+        const QDir projectDirectory = QFileInfo(path).absoluteDir();
+        QJsonObject root {
+            {"application", "Stereo Aligner"},
+            {"version", 1},
+            {"leftEye", eyeToJson(leftInfo, leftUi, leftColor, projectDirectory)},
+            {"rightEye", eyeToJson(rightInfo, rightUi, rightColor, projectDirectory)},
+            {"crop", QJsonObject {{"left", cropLeft->value()}, {"right", cropRight->value()},
+                                   {"top", cropTop->value()}, {"bottom", cropBottom->value()}}},
+            {"interface", QJsonObject {
+                {"linkedStepping", linkStepping->isChecked()},
+                {"previewMode", previewMode->currentIndex()},
+                {"theme", themeSelector->currentIndex()},
+                {"outputMode", outputMode->currentIndex()},
+                {"audioSource", audioSource->currentIndex()},
+                {"colorReference", colorReference->currentIndex()}
+            }}
+        };
+        QSaveFile file(path);
+        if (!file.open(QIODevice::WriteOnly) ||
+            file.write(QJsonDocument(root).toJson(QJsonDocument::Indented)) < 0 || !file.commit()) {
+            QMessageBox::critical(this, "Could not save project",
+                                  "The project file could not be written:\n" + QDir::toNativeSeparators(path));
+            return;
+        }
+        projectPath = QFileInfo(path).absoluteFilePath();
+        setWindowTitle("Stereo Aligner — " + QFileInfo(projectPath).completeBaseName());
+        status->setText("Project saved: " + QFileInfo(projectPath).fileName());
+    }
+
+    void restoreEye(const QJsonObject &eye, EyeControls &ui, ColorCorrection &color)
+    {
+        ui.frame->setValue(eye.value("frame").toInt(0));
+        ui.x->setValue(eye.value("x").toInt(0));
+        ui.y->setValue(eye.value("y").toInt(0));
+        ui.zoom->setValue(eye.value("zoomPercent").toDouble(100.0));
+        color = colorFromJson(eye.value("color").toObject());
+    }
+
+    void openProject()
+    {
+        const QString path = QFileDialog::getOpenFileName(this, "Open Stereo Aligner project", projectPath,
+                                                         "Stereo Aligner project (*.json);;JSON files (*.json)");
+        if (path.isEmpty()) return;
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) {
+            QMessageBox::critical(this, "Could not open project", "The selected JSON file could not be read.");
+            return;
+        }
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
+        if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+            QMessageBox::critical(this, "Invalid project",
+                                  "The selected file is not valid project JSON.\n\n" + parseError.errorString());
+            return;
+        }
+        const QJsonObject root = document.object();
+        if (root.value("application").toString() != "Stereo Aligner" ||
+            root.value("version").toInt() != 1 ||
+            !root.value("leftEye").isObject() || !root.value("rightEye").isObject()) {
+            QMessageBox::critical(this, "Invalid project",
+                                  "This is not a supported Stereo Aligner project file.");
+            return;
+        }
+        const QJsonObject leftEye = root.value("leftEye").toObject();
+        const QJsonObject rightEye = root.value("rightEye").toObject();
+        const QDir projectDirectory = QFileInfo(path).absoluteDir();
+        const QString leftPath = resolvedVideoPath(leftEye, projectDirectory);
+        const QString rightPath = resolvedVideoPath(rightEye, projectDirectory);
+        if (leftPath.isEmpty() || rightPath.isEmpty()) {
+            QStringList missing;
+            if (leftPath.isEmpty()) missing << "Left video: " + leftEye.value("path").toString();
+            if (rightPath.isEmpty()) missing << "Right video: " + rightEye.value("path").toString();
+            QMessageBox::warning(this, "Project videos not found",
+                                 "The project was not changed because these videos could not be found:\n\n" +
+                                 missing.join('\n'));
+            return;
+        }
+
+        previewTimer.stop();
+        loadVideo(true, leftPath);
+        loadVideo(false, rightPath);
+        if (!leftInfo.valid() || !rightInfo.valid() ||
+            QFileInfo(leftInfo.path).absoluteFilePath() != leftPath ||
+            QFileInfo(rightInfo.path).absoluteFilePath() != rightPath) {
+            QMessageBox::critical(this, "Could not restore project",
+                                  "One of the project videos could not be opened.");
+            return;
+        }
+        restoreEye(leftEye, leftUi, leftColor);
+        restoreEye(rightEye, rightUi, rightColor);
+        const QJsonObject crop = root.value("crop").toObject();
+        cropLeft->setValue(crop.value("left").toInt(0));
+        cropRight->setValue(crop.value("right").toInt(0));
+        cropTop->setValue(crop.value("top").toInt(0));
+        cropBottom->setValue(crop.value("bottom").toInt(0));
+        const QJsonObject interface = root.value("interface").toObject();
+        linkStepping->setChecked(interface.value("linkedStepping").toBool(false));
+        previewMode->setCurrentIndex(qBound(0, interface.value("previewMode").toInt(0), previewMode->count() - 1));
+        themeSelector->setCurrentIndex(qBound(0, interface.value("theme").toInt(0), themeSelector->count() - 1));
+        outputMode->setCurrentIndex(qBound(0, interface.value("outputMode").toInt(0), outputMode->count() - 1));
+        audioSource->setCurrentIndex(qBound(0, interface.value("audioSource").toInt(0), audioSource->count() - 1));
+        colorReference->setCurrentIndex(qBound(0, interface.value("colorReference").toInt(0), colorReference->count() - 1));
+        projectPath = QFileInfo(path).absoluteFilePath();
+        setWindowTitle("Stereo Aligner — " + QFileInfo(projectPath).completeBaseName());
+        updateColorSummary();
+        updateReadyState();
+        requestPreview();
+        status->setText("Project restored: " + QFileInfo(projectPath).fileName());
     }
 
     void chooseVideo(bool left)
@@ -715,6 +920,7 @@ private:
         autoColorButton->setEnabled(leftReady && rightReady && !exportProcess);
         colorReference->setEnabled(leftReady && rightReady && !exportProcess);
         resetColorButton->setEnabled(leftReady && rightReady);
+        saveProjectButton->setEnabled(leftReady || rightReady);
         resetCropButton->setEnabled(leftReady && rightReady);
         for (QSpinBox *spin : {cropLeft, cropRight, cropTop, cropBottom})
             spin->setEnabled(leftReady && rightReady);
