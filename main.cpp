@@ -4,6 +4,7 @@
 #include <opencv2/features2d.hpp>
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 struct VideoInfo
@@ -45,6 +46,19 @@ struct AlignmentEstimate
     int matches = 0;
     int inliers = 0;
     bool valid = false;
+};
+
+struct ColorCorrection
+{
+    double gain[3] {1.0, 1.0, 1.0};
+    double offset[3] {0.0, 0.0, 0.0};
+
+    bool isIdentity() const
+    {
+        for (int channel = 0; channel < 3; ++channel)
+            if (qAbs(gain[channel] - 1.0) > 0.0001 || qAbs(offset[channel]) > 0.0001) return false;
+        return true;
+    }
 };
 
 class StereoAlignerWindow final : public QMainWindow
@@ -118,6 +132,8 @@ private:
     VideoInfo rightInfo;
     EyeControls leftUi;
     EyeControls rightUi;
+    ColorCorrection leftColor;
+    ColorCorrection rightColor;
     QString ffmpegPath;
 
     QLabel *leftPreview = nullptr;
@@ -137,6 +153,10 @@ private:
     QSpinBox *cropBottom = nullptr;
     QPushButton *autoCropButton = nullptr;
     QPushButton *resetCropButton = nullptr;
+    QComboBox *colorReference = nullptr;
+    QLabel *colorSummary = nullptr;
+    QPushButton *autoColorButton = nullptr;
+    QPushButton *resetColorButton = nullptr;
     QPushButton *exportButton = nullptr;
     QPushButton *cancelButton = nullptr;
     QProgressBar *progress = nullptr;
@@ -342,6 +362,24 @@ private:
         cropGrid->addWidget(resetCropButton, 3, 0, 1, 4);
         drawerLayout->addWidget(cropGroup);
 
+        auto *colorGroup = new QGroupBox("Color match");
+        auto *colorGrid = new QGridLayout(colorGroup);
+        colorReference = new QComboBox;
+        colorReference->addItems({"Left eye as reference", "Right eye as reference"});
+        colorReference->setToolTip("The reference eye remains unchanged; the other eye is corrected to match it.");
+        colorSummary = new QLabel("No color correction");
+        colorSummary->setObjectName("details");
+        colorSummary->setWordWrap(true);
+        autoColorButton = new QPushButton("Auto match selected frames");
+        autoColorButton->setToolTip("Match the other eye's RGB color balance and contrast to the selected reference eye.");
+        resetColorButton = new QPushButton("Reset color");
+        colorGrid->addWidget(new QLabel("Reference"), 0, 0);
+        colorGrid->addWidget(colorReference, 0, 1);
+        colorGrid->addWidget(colorSummary, 1, 0, 1, 2);
+        colorGrid->addWidget(autoColorButton, 2, 0, 1, 2);
+        colorGrid->addWidget(resetColorButton, 3, 0, 1, 2);
+        drawerLayout->addWidget(colorGroup);
+
         auto *exportGroup = new QGroupBox("Output");
         auto *exportGrid = new QGridLayout(exportGroup);
         outputMode = new QComboBox;
@@ -524,6 +562,13 @@ private:
             cropLeft->setValue(0); cropRight->setValue(0);
             cropTop->setValue(0); cropBottom->setValue(0);
         });
+        connect(autoColorButton, &QPushButton::clicked, this, [this] { autoMatchColor(); });
+        connect(resetColorButton, &QPushButton::clicked, this, [this] {
+            leftColor = ColorCorrection{};
+            rightColor = ColorCorrection{};
+            updateColorSummary();
+            requestPreview();
+        });
         connect(exportButton, &QPushButton::clicked, this, [this] { startExport(); });
         connect(cancelButton, &QPushButton::clicked, this, [this] {
             if (exportProcess) {
@@ -605,6 +650,9 @@ private:
         VideoInfo &target = left ? leftInfo : rightInfo;
         EyeControls &ui = left ? leftUi : rightUi;
         target = info;
+        leftColor = ColorCorrection{};
+        rightColor = ColorCorrection{};
+        updateColorSummary();
         ui.fileName->setText(QFileInfo(path).fileName());
         ui.fileName->setToolTip(path);
         ui.details->setText(QString("%1  •  %2 × %3 display  •  %4 fps  •  %5  •  approximately %6 frames")
@@ -664,6 +712,9 @@ private:
         exportButton->setEnabled(leftReady && rightReady && !exportProcess);
         autoAlignButton->setEnabled(leftReady && rightReady && !exportProcess);
         autoCropButton->setEnabled(leftReady && rightReady && !exportProcess);
+        autoColorButton->setEnabled(leftReady && rightReady && !exportProcess);
+        colorReference->setEnabled(leftReady && rightReady && !exportProcess);
+        resetColorButton->setEnabled(leftReady && rightReady);
         resetCropButton->setEnabled(leftReady && rightReady);
         for (QSpinBox *spin : {cropLeft, cropRight, cropTop, cropBottom})
             spin->setEnabled(leftReady && rightReady);
@@ -952,6 +1003,149 @@ private:
         status->setText(QString("Auto crop: %1 × %2 per eye").arg(crop.width()).arg(crop.height()));
     }
 
+    static QImage applyColorCorrection(const QImage &source, const ColorCorrection &correction)
+    {
+        if (source.isNull() || correction.isIdentity()) return source;
+        QImage result = source.convertToFormat(QImage::Format_RGB32);
+        for (int y = 0; y < result.height(); ++y) {
+            QRgb *line = reinterpret_cast<QRgb*>(result.scanLine(y));
+            for (int x = 0; x < result.width(); ++x) {
+                const QRgb pixel = line[x];
+                const int red = qBound(0, qRound(qRed(pixel) * correction.gain[0] + correction.offset[0]), 255);
+                const int green = qBound(0, qRound(qGreen(pixel) * correction.gain[1] + correction.offset[1]), 255);
+                const int blue = qBound(0, qRound(qBlue(pixel) * correction.gain[2] + correction.offset[2]), 255);
+                line[x] = qRgb(red, green, blue);
+            }
+        }
+        return result;
+    }
+
+    static int histogramPercentile(const std::array<int, 256> &histogram, int count, double percentile)
+    {
+        const int target = qRound(qBound(0.0, percentile, 1.0) * qMax(0, count - 1));
+        int accumulated = 0;
+        for (int value = 0; value < 256; ++value) {
+            accumulated += histogram[value];
+            if (accumulated > target) return value;
+        }
+        return 255;
+    }
+
+    static bool estimateColorCorrection(const QImage &reference, const QImage &target,
+                                        ColorCorrection &correction, QString &error)
+    {
+        if (reference.isNull() || target.isNull() || reference.size() != target.size()) {
+            error = "The aligned frame images could not be compared.";
+            return false;
+        }
+        std::array<std::array<int, 256>, 3> referenceHistogram {};
+        std::array<std::array<int, 256>, 3> targetHistogram {};
+        int count = 0;
+        for (int y = 0; y < reference.height(); y += 2) {
+            const QRgb *referenceLine = reinterpret_cast<const QRgb*>(reference.constScanLine(y));
+            const QRgb *targetLine = reinterpret_cast<const QRgb*>(target.constScanLine(y));
+            for (int x = 0; x < reference.width(); x += 2) {
+                const QRgb base = referenceLine[x];
+                const QRgb other = targetLine[x];
+                const int baseLuma = qGray(base);
+                const int otherLuma = qGray(other);
+                if (baseLuma < 8 || otherLuma < 8 || baseLuma > 247 || otherLuma > 247) continue;
+                const int baseChannels[3] {qRed(base), qGreen(base), qBlue(base)};
+                const int otherChannels[3] {qRed(other), qGreen(other), qBlue(other)};
+                for (int channel = 0; channel < 3; ++channel) {
+                    ++referenceHistogram[channel][baseChannels[channel]];
+                    ++targetHistogram[channel][otherChannels[channel]];
+                }
+                ++count;
+            }
+        }
+        if (count < 1000) {
+            error = "Not enough non-black, non-clipped image detail was available for reliable color matching.";
+            return false;
+        }
+        correction = ColorCorrection{};
+        for (int channel = 0; channel < 3; ++channel) {
+            const int baseLow = histogramPercentile(referenceHistogram[channel], count, 0.10);
+            const int baseMiddle = histogramPercentile(referenceHistogram[channel], count, 0.50);
+            const int baseHigh = histogramPercentile(referenceHistogram[channel], count, 0.90);
+            const int targetLow = histogramPercentile(targetHistogram[channel], count, 0.10);
+            const int targetMiddle = histogramPercentile(targetHistogram[channel], count, 0.50);
+            const int targetHigh = histogramPercentile(targetHistogram[channel], count, 0.90);
+            if (targetHigh - targetLow < 8 || baseHigh - baseLow < 8) {
+                error = "The selected frames do not contain enough tonal range for reliable color matching.";
+                return false;
+            }
+            correction.gain[channel] = qBound(0.60,
+                (baseHigh - baseLow) / static_cast<double>(targetHigh - targetLow), 1.67);
+            correction.offset[channel] = qBound(-64.0,
+                baseMiddle - correction.gain[channel] * targetMiddle, 64.0);
+        }
+        return true;
+    }
+
+    void updateColorSummary()
+    {
+        if (leftColor.isIdentity() && rightColor.isIdentity()) {
+            colorSummary->setText("No color correction");
+            return;
+        }
+        const bool rightWasCorrected = !rightColor.isIdentity();
+        const ColorCorrection &correction = rightWasCorrected ? rightColor : leftColor;
+        colorSummary->setText(QString("%1 corrected to %2  •  R %3/%4  G %5/%6  B %7/%8")
+            .arg(rightWasCorrected ? "Right" : "Left", rightWasCorrected ? "left" : "right")
+            .arg(correction.gain[0], 0, 'f', 3).arg(correction.offset[0], 0, 'f', 1)
+            .arg(correction.gain[1], 0, 'f', 3).arg(correction.offset[1], 0, 'f', 1)
+            .arg(correction.gain[2], 0, 'f', 3).arg(correction.offset[2], 0, 'f', 1));
+    }
+
+    void autoMatchColor()
+    {
+        if (!leftInfo.valid() || !rightInfo.valid()) return;
+        status->setText("Analyzing color balance…");
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        const int fullWidth = qMin(leftInfo.displayWidth, rightInfo.displayWidth);
+        const int fullHeight = qMin(leftInfo.displayHeight, rightInfo.displayHeight);
+        const double scale = qMin(1.0, 1200.0 / fullWidth);
+        const QSize canvas(qMax(2, qRound(fullWidth * scale)), qMax(2, qRound(fullHeight * scale)));
+        QImage leftRaw = extractFrame(leftInfo, leftUi.frame->value(), canvas.width());
+        QImage rightRaw = extractFrame(rightInfo, rightUi.frame->value(), canvas.width());
+        QImage left = alignedImage(leftRaw, leftUi.x->value(), leftUi.y->value(), leftUi.zoom->value(),
+                                   fullWidth, fullHeight, canvas);
+        QImage right = alignedImage(rightRaw, rightUi.x->value(), rightUi.y->value(), rightUi.zoom->value(),
+                                    fullWidth, fullHeight, canvas);
+        const QRect crop = effectiveCropRect(fullWidth, fullHeight);
+        const int x1 = qRound(crop.x() * canvas.width() / static_cast<double>(fullWidth));
+        const int y1 = qRound(crop.y() * canvas.height() / static_cast<double>(fullHeight));
+        const int x2 = qRound((crop.x() + crop.width()) * canvas.width() / static_cast<double>(fullWidth));
+        const int y2 = qRound((crop.y() + crop.height()) * canvas.height() / static_cast<double>(fullHeight));
+        const QRect scaledCrop(x1, y1, qMax(1, x2 - x1), qMax(1, y2 - y1));
+        left = left.copy(scaledCrop.intersected(left.rect()));
+        right = right.copy(scaledCrop.intersected(right.rect()));
+
+        ColorCorrection correction;
+        QString error;
+        const bool leftReference = colorReference->currentIndex() == 0;
+        const bool ok = estimateColorCorrection(leftReference ? left : right,
+                                                leftReference ? right : left, correction, error);
+        QApplication::restoreOverrideCursor();
+        if (!ok) {
+            status->setText("Color matching failed");
+            QMessageBox::warning(this, "Color matching failed", error);
+            return;
+        }
+        if (leftReference) {
+            leftColor = ColorCorrection{};
+            rightColor = correction;
+        } else {
+            rightColor = ColorCorrection{};
+            leftColor = correction;
+        }
+        updateColorSummary();
+        requestPreview();
+        status->setText(QString("Matched %1 eye colors to the %2 eye")
+                        .arg(leftReference ? "right" : "left", leftReference ? "left" : "right"));
+    }
+
     static QImage alignedImage(const QImage &source, int x, int y, double zoomPercent,
                                int fullWidth, int fullHeight, QSize canvas)
     {
@@ -987,6 +1181,8 @@ private:
         const int decodeWidth = qMin(1600, qMax(2, canvas.width()));
         QImage leftRaw = extractFrame(leftInfo, leftUi.frame->value(), decodeWidth);
         QImage rightRaw = extractFrame(rightInfo, rightUi.frame->value(), decodeWidth);
+        leftRaw = applyColorCorrection(leftRaw, leftColor);
+        rightRaw = applyColorCorrection(rightRaw, rightColor);
         QImage left = alignedImage(leftRaw, leftUi.x->value(), leftUi.y->value(), leftUi.zoom->value(), canvasW, canvasH, canvas);
         QImage right = alignedImage(rightRaw, rightUi.x->value(), rightUi.y->value(), rightUi.zoom->value(), canvasW, canvasH, canvas);
         const QRect sourceCrop = effectiveCropRect(canvasW, canvasH);
@@ -1054,6 +1250,19 @@ private:
             .arg(rt - lt, 0, 'f', 3).arg(secondsText(remaining)));
     }
 
+    static QString ffmpegColorFilter(const ColorCorrection &correction)
+    {
+        if (correction.isIdentity()) return {};
+        const auto expression = [&correction](int channel) {
+            const QString gain = QString::number(correction.gain[channel], 'f', 6);
+            const QString offset = QString::number(correction.offset[channel], 'f', 6);
+            return QString("clip(val*%1%2%3,0,255)")
+                .arg(gain, correction.offset[channel] >= 0.0 ? "+" : "", offset);
+        };
+        return QString(",lutrgb=r='%1':g='%2':b='%3'")
+            .arg(expression(0), expression(1), expression(2));
+    }
+
     void startExport()
     {
         if (!leftInfo.valid() || !rightInfo.valid() || exportProcess) return;
@@ -1079,8 +1288,10 @@ private:
             const int zoomHeight = qMax(2, qRound((height * zoom) / 2.0) * 2);
             const int centeredX = (width - zoomWidth) / 2 + x;
             const int centeredY = (height - zoomHeight) / 2 + y;
-            return QString("[%1:v]trim=start=%2:duration=%3,setpts=PTS-STARTPTS,scale=%4:%5,setsar=1,fps=%6[eye%7];")
-                .arg(input).arg(start, 0, 'f', 6).arg(exportDuration, 0, 'f', 6).arg(zoomWidth).arg(zoomHeight).arg(fps, 0, 'f', 6).arg(name)
+            const ColorCorrection &correction = input == 0 ? leftColor : rightColor;
+            return QString("[%1:v]trim=start=%2:duration=%3,setpts=PTS-STARTPTS,scale=%4:%5%8,setsar=1,fps=%6[eye%7];")
+                .arg(input).arg(start, 0, 'f', 6).arg(exportDuration, 0, 'f', 6).arg(zoomWidth).arg(zoomHeight)
+                .arg(fps, 0, 'f', 6).arg(name).arg(ffmpegColorFilter(correction))
                 + QString("color=c=black:s=%1x%2:r=%3:d=%4[base%5];[base%5][eye%5]overlay=x=%6:y=%7:shortest=1[placed%5];"
                           "[placed%5]crop=%8:%9:%10:%11[%5]")
                 .arg(width).arg(height).arg(fps, 0, 'f', 6).arg(exportDuration, 0, 'f', 6).arg(name)
