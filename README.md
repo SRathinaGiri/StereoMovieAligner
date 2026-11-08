@@ -8,7 +8,10 @@ Stereo Aligner is a Qt 6 Widgets application for synchronizing and aligning two 
 - Step either video backward or forward by exactly one frame.
 - Optional linked stepping for moving both timelines together.
 - Independent horizontal (X) and vertical (Y) alignment for both eyes.
+- Automatic portrait/landscape detection with compact side-by-side portrait previews.
 - Side-by-side, red/cyan anaglyph, and difference previews.
+- Light and dark themes, with light selected by default.
+- English/US number formatting independent of Windows regional settings.
 - Full side-by-side, half side-by-side, and red/cyan anaglyph MP4 export.
 - Export begins at the frame pair currently selected in the UI.
 - Choose audio from the left video, right video, or no audio.

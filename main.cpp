@@ -45,6 +45,10 @@ public:
 
         buildUi();
         connectUi();
+        QSettings settings;
+        const int savedTheme = qBound(0, settings.value("appearance/theme", 0).toInt(), 1);
+        themeSelector->setCurrentIndex(savedTheme);
+        applyTheme(savedTheme == 1);
         setWindowTitle("Stereo Aligner");
         resize(1500, 940);
         setMinimumSize(1050, 720);
@@ -93,6 +97,7 @@ private:
     QLabel *singlePreview = nullptr;
     QStackedWidget *previewStack = nullptr;
     QComboBox *previewMode = nullptr;
+    QComboBox *themeSelector = nullptr;
     QComboBox *outputMode = nullptr;
     QComboBox *audioSource = nullptr;
     QCheckBox *linkStepping = nullptr;
@@ -122,6 +127,56 @@ private:
             .arg(millis, 3, 10, QLatin1Char('0'));
     }
 
+    static QString orientationName(const VideoInfo &info)
+    {
+        if (info.displayHeight > info.displayWidth) return "Portrait";
+        if (info.displayWidth > info.displayHeight) return "Landscape";
+        return "Square";
+    }
+
+    void applyTheme(bool dark)
+    {
+        if (dark) {
+            setStyleSheet(R"(
+                QMainWindow, QWidget { background: #11161e; color: #e7edf5; font-size: 13px; }
+                QLabel#title { font-size: 28px; font-weight: 700; color: #ffffff; }
+                QLabel#subtitle, QLabel#details { color: #8fa1b7; }
+                QLabel#summary { color: #a9bad0; padding: 3px; }
+                QGroupBox { border: 1px solid #2c3949; border-radius: 7px; margin-top: 9px; padding-top: 11px; font-weight: 600; }
+                QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #9fb4cb; }
+                QPushButton, QComboBox, QSpinBox { background: #202a37; border: 1px solid #39495c; border-radius: 5px; padding: 6px 9px; }
+                QPushButton:hover { background: #2a3949; border-color: #5b7692; }
+                QPushButton:disabled { color: #657181; background: #19212b; }
+                QPushButton#primaryButton { background: #1769aa; border-color: #3187c9; color: white; font-weight: 700; }
+                QPushButton#primaryButton:hover { background: #207dc4; }
+                QSlider::groove:horizontal { height: 5px; background: #2b3745; border-radius: 2px; }
+                QSlider::handle:horizontal { width: 15px; margin: -5px 0; border-radius: 7px; background: #42a5e8; }
+                QProgressBar { border: 1px solid #344253; border-radius: 4px; background: #19212b; text-align: center; }
+                QProgressBar::chunk { background: #287eb9; }
+                QToolTip { background: #273342; color: white; border: 1px solid #5b6c80; }
+            )");
+        } else {
+            setStyleSheet(R"(
+                QMainWindow, QWidget { background: #f5f7fa; color: #182433; font-size: 13px; }
+                QLabel#title { font-size: 28px; font-weight: 700; color: #132033; }
+                QLabel#subtitle, QLabel#details { color: #5e7085; }
+                QLabel#summary { color: #465b72; padding: 3px; }
+                QGroupBox { border: 1px solid #cbd5e1; border-radius: 7px; margin-top: 9px; padding-top: 11px; font-weight: 600; background: #ffffff; }
+                QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #41566e; background: #f5f7fa; }
+                QPushButton, QComboBox, QSpinBox { background: #ffffff; border: 1px solid #b9c6d4; border-radius: 5px; padding: 6px 9px; }
+                QPushButton:hover { background: #edf4fa; border-color: #7195b7; }
+                QPushButton:disabled { color: #9aa7b4; background: #edf0f3; }
+                QPushButton#primaryButton { background: #1672b8; border-color: #12639f; color: white; font-weight: 700; }
+                QPushButton#primaryButton:hover { background: #2184cc; }
+                QSlider::groove:horizontal { height: 5px; background: #d4dde6; border-radius: 2px; }
+                QSlider::handle:horizontal { width: 15px; margin: -5px 0; border-radius: 7px; background: #1672b8; }
+                QProgressBar { border: 1px solid #b9c6d4; border-radius: 4px; background: #ffffff; text-align: center; }
+                QProgressBar::chunk { background: #2b83bf; }
+                QToolTip { background: #ffffff; color: #182433; border: 1px solid #9cabb9; }
+            )");
+        }
+    }
+
     void buildUi()
     {
         auto *root = new QWidget;
@@ -142,8 +197,13 @@ private:
         header->addStretch();
         previewMode = new QComboBox;
         previewMode->addItems({"Side by side", "Red / cyan anaglyph", "Difference"});
+        themeSelector = new QComboBox;
+        themeSelector->addItems({"Light", "Dark"});
         header->addWidget(new QLabel("Preview:"));
         header->addWidget(previewMode);
+        header->addSpacing(8);
+        header->addWidget(new QLabel("Theme:"));
+        header->addWidget(themeSelector);
         main->addLayout(header);
 
         auto *fileRow = new QHBoxLayout;
@@ -157,10 +217,11 @@ private:
         auto *sbs = new QHBoxLayout(sbsPage);
         sbs->setContentsMargins(0, 0, 0, 0);
         sbs->setSpacing(6);
+        sbs->setAlignment(Qt::AlignCenter);
         leftPreview = makePreviewLabel("LEFT");
         rightPreview = makePreviewLabel("RIGHT");
-        sbs->addWidget(leftPreview, 1);
-        sbs->addWidget(rightPreview, 1);
+        sbs->addWidget(leftPreview);
+        sbs->addWidget(rightPreview);
         singlePreview = makePreviewLabel("PREVIEW");
         previewStack->addWidget(sbsPage);
         previewStack->addWidget(singlePreview);
@@ -229,24 +290,6 @@ private:
         statusRow->addWidget(status);
         main->addLayout(statusRow);
 
-        setStyleSheet(R"(
-            QMainWindow, QWidget { background: #11161e; color: #e7edf5; font-size: 13px; }
-            QLabel#title { font-size: 28px; font-weight: 700; color: #ffffff; }
-            QLabel#subtitle { color: #8fa1b7; }
-            QLabel#summary { color: #a9bad0; padding: 3px; }
-            QGroupBox { border: 1px solid #2c3949; border-radius: 7px; margin-top: 9px; padding-top: 11px; font-weight: 600; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #9fb4cb; }
-            QPushButton, QComboBox, QSpinBox { background: #202a37; border: 1px solid #39495c; border-radius: 5px; padding: 6px 9px; }
-            QPushButton:hover { background: #2a3949; border-color: #5b7692; }
-            QPushButton:disabled { color: #657181; background: #19212b; }
-            QPushButton#primaryButton { background: #1769aa; border-color: #3187c9; font-weight: 700; }
-            QPushButton#primaryButton:hover { background: #207dc4; }
-            QSlider::groove:horizontal { height: 5px; background: #2b3745; border-radius: 2px; }
-            QSlider::handle:horizontal { width: 15px; margin: -5px 0; border-radius: 7px; background: #42a5e8; }
-            QProgressBar { border: 1px solid #344253; border-radius: 4px; background: #19212b; text-align: center; }
-            QProgressBar::chunk { background: #287eb9; }
-            QToolTip { background: #273342; color: white; border: 1px solid #5b6c80; }
-        )");
     }
 
     QWidget *makeFileCard(bool left)
@@ -258,7 +301,7 @@ private:
         ui.fileName = new QLabel("No video loaded");
         ui.fileName->setTextInteractionFlags(Qt::TextSelectableByMouse);
         ui.details = new QLabel("—");
-        ui.details->setStyleSheet("color:#8294aa");
+        ui.details->setObjectName("details");
         layout->addWidget(ui.open, 0, 0);
         layout->addWidget(ui.fileName, 0, 1);
         layout->addWidget(ui.details, 1, 0, 1, 2);
@@ -327,6 +370,10 @@ private:
         connect(previewMode, &QComboBox::currentIndexChanged, this, [this] {
             previewStack->setCurrentIndex(previewMode->currentIndex() == 0 ? 0 : 1);
             requestPreview();
+        });
+        connect(themeSelector, &QComboBox::currentIndexChanged, this, [this](int index) {
+            QSettings().setValue("appearance/theme", index);
+            applyTheme(index == 1);
         });
         connect(resetAlignment, &QPushButton::clicked, this, [this] {
             leftUi.x->setValue(0); leftUi.y->setValue(0);
@@ -415,8 +462,8 @@ private:
         target = info;
         ui.fileName->setText(QFileInfo(path).fileName());
         ui.fileName->setToolTip(path);
-        ui.details->setText(QString("%1 × %2 display  •  %3 fps  •  %4  •  approximately %5 frames")
-            .arg(info.displayWidth).arg(info.displayHeight).arg(info.fps, 0, 'f', 3)
+        ui.details->setText(QString("%1  •  %2 × %3 display  •  %4 fps  •  %5  •  approximately %6 frames")
+            .arg(orientationName(info)).arg(info.displayWidth).arg(info.displayHeight).arg(info.fps, 0, 'f', 3)
             .arg(secondsText(info.duration)).arg(info.totalFrames));
         ui.slider->setRange(0, qMax(0, info.totalFrames - 1));
         ui.frame->setRange(0, qMax(0, info.totalFrames - 1));
@@ -545,6 +592,10 @@ private:
         QImage right = alignedImage(rightRaw, rightUi.x->value(), rightUi.y->value(), canvasW, canvasH, canvas);
 
         if (previewMode->currentIndex() == 0) {
+            // Keep portrait eyes as a compact centered pair instead of stretching
+            // their labels across the full width of the window.
+            leftPreview->setFixedSize(canvas);
+            rightPreview->setFixedSize(canvas);
             leftPreview->setPixmap(QPixmap::fromImage(left));
             rightPreview->setPixmap(QPixmap::fromImage(right));
         } else {
@@ -582,7 +633,10 @@ private:
         const double lt = leftUi.frame->value() / leftInfo.fps;
         const double rt = rightUi.frame->value() / rightInfo.fps;
         const double remaining = qMin(leftInfo.duration - lt, rightInfo.duration - rt);
-        syncSummary->setText(QString("Selected pair  •  Left %1 @ %2  •  Right %3 @ %4  •  Offset R−L: %5 s  •  Export length: %6")
+        const QString layout = QString("%1 preview").arg(
+            leftInfo.displayHeight > leftInfo.displayWidth ? "Portrait" : "Landscape");
+        syncSummary->setText(QString("%1  •  Selected pair  •  Left %2 @ %3  •  Right %4 @ %5  •  Offset R−L: %6 s  •  Export length: %7")
+            .arg(layout)
             .arg(leftUi.frame->value()).arg(secondsText(lt)).arg(rightUi.frame->value()).arg(secondsText(rt))
             .arg(rt - lt, 0, 'f', 3).arg(secondsText(remaining)));
     }
@@ -683,6 +737,7 @@ private:
 
 int main(int argc, char *argv[])
 {
+    QLocale::setDefault(QLocale(QLocale::English, QLocale::UnitedStates));
     QApplication app(argc, argv);
     QApplication::setApplicationName("Stereo Aligner");
     QApplication::setOrganizationName("Stereo Tools");
