@@ -131,6 +131,12 @@ private:
     QCheckBox *linkStepping = nullptr;
     QPushButton *resetAlignment = nullptr;
     QPushButton *autoAlignButton = nullptr;
+    QSpinBox *cropLeft = nullptr;
+    QSpinBox *cropRight = nullptr;
+    QSpinBox *cropTop = nullptr;
+    QSpinBox *cropBottom = nullptr;
+    QPushButton *autoCropButton = nullptr;
+    QPushButton *resetCropButton = nullptr;
     QPushButton *exportButton = nullptr;
     QPushButton *cancelButton = nullptr;
     QProgressBar *progress = nullptr;
@@ -315,6 +321,27 @@ private:
         align->addWidget(resetAlignment, 6, 0, 1, 3);
         drawerLayout->addWidget(alignGroup);
 
+        auto *cropGroup = new QGroupBox("Crop aligned pair");
+        auto *cropGrid = new QGridLayout(cropGroup);
+        setupCropSpin(cropLeft, "Left");
+        setupCropSpin(cropRight, "Right");
+        setupCropSpin(cropTop, "Top");
+        setupCropSpin(cropBottom, "Bottom");
+        cropGrid->addWidget(new QLabel("Left"), 0, 0);
+        cropGrid->addWidget(cropLeft, 0, 1);
+        cropGrid->addWidget(new QLabel("Right"), 0, 2);
+        cropGrid->addWidget(cropRight, 0, 3);
+        cropGrid->addWidget(new QLabel("Top"), 1, 0);
+        cropGrid->addWidget(cropTop, 1, 1);
+        cropGrid->addWidget(new QLabel("Bottom"), 1, 2);
+        cropGrid->addWidget(cropBottom, 1, 3);
+        autoCropButton = new QPushButton("Auto crop black borders");
+        autoCropButton->setToolTip("Find the largest common rectangle covered by both transformed videos.");
+        resetCropButton = new QPushButton("Reset crop");
+        cropGrid->addWidget(autoCropButton, 2, 0, 1, 4);
+        cropGrid->addWidget(resetCropButton, 3, 0, 1, 4);
+        drawerLayout->addWidget(cropGroup);
+
         auto *exportGroup = new QGroupBox("Output");
         auto *exportGrid = new QGridLayout(exportGroup);
         outputMode = new QComboBox;
@@ -450,6 +477,16 @@ private:
         spin->setToolTip("Scale this camera around the center. Below 100% zooms out; above 100% zooms in.");
     }
 
+    static void setupCropSpin(QSpinBox *&spin, const QString &side)
+    {
+        spin = new QSpinBox;
+        spin->setRange(0, 8000);
+        spin->setSuffix(" px");
+        spin->setKeyboardTracking(false);
+        spin->setToolTip(QString("Crop %1 pixels from the %2 side of both aligned eyes.")
+                         .arg(side.toLower(), side.toLower()));
+    }
+
     void connectUi()
     {
         connect(leftUi.open, &QPushButton::clicked, this, [this] { chooseVideo(true); });
@@ -465,6 +502,8 @@ private:
             connect(spin, &QSpinBox::valueChanged, this, [this] { updateSummary(); requestPreview(); });
         for (QDoubleSpinBox *spin : {leftUi.zoom, rightUi.zoom})
             connect(spin, &QDoubleSpinBox::valueChanged, this, [this] { updateSummary(); requestPreview(); });
+        for (QSpinBox *spin : {cropLeft, cropRight, cropTop, cropBottom})
+            connect(spin, &QSpinBox::valueChanged, this, [this] { updateSummary(); requestPreview(); });
 
         connect(previewMode, &QComboBox::currentIndexChanged, this, [this] {
             previewStack->setCurrentIndex(previewMode->currentIndex() == 0 ? 0 : 1);
@@ -480,6 +519,11 @@ private:
             leftUi.zoom->setValue(100.0); rightUi.zoom->setValue(100.0);
         });
         connect(autoAlignButton, &QPushButton::clicked, this, [this] { autoAlign(); });
+        connect(autoCropButton, &QPushButton::clicked, this, [this] { autoCropBorders(); });
+        connect(resetCropButton, &QPushButton::clicked, this, [this] {
+            cropLeft->setValue(0); cropRight->setValue(0);
+            cropTop->setValue(0); cropBottom->setValue(0);
+        });
         connect(exportButton, &QPushButton::clicked, this, [this] { startExport(); });
         connect(cancelButton, &QPushButton::clicked, this, [this] {
             if (exportProcess) {
@@ -619,6 +663,10 @@ private:
         for (QWidget *w : rightWidgets) w->setEnabled(rightReady);
         exportButton->setEnabled(leftReady && rightReady && !exportProcess);
         autoAlignButton->setEnabled(leftReady && rightReady && !exportProcess);
+        autoCropButton->setEnabled(leftReady && rightReady && !exportProcess);
+        resetCropButton->setEnabled(leftReady && rightReady);
+        for (QSpinBox *spin : {cropLeft, cropRight, cropTop, cropBottom})
+            spin->setEnabled(leftReady && rightReady);
         resetAlignment->setEnabled(leftReady || rightReady);
         updateSummary();
     }
@@ -849,8 +897,59 @@ private:
             leftUi.y->setValue(qRound(-y / 2.0));
             rightUi.y->setValue(qRound(y / 2.0));
         }
+        autoCropBorders();
         updateSummary();
         requestPreview();
+    }
+
+    QRect effectiveCropRect(int width, int height) const
+    {
+        if (width < 2 || height < 2) return QRect(0, 0, qMax(1, width), qMax(1, height));
+        const int left = qBound(0, cropLeft->value(), width - 2);
+        const int top = qBound(0, cropTop->value(), height - 2);
+        const int right = qBound(0, cropRight->value(), width - left - 2);
+        const int bottom = qBound(0, cropBottom->value(), height - top - 2);
+        int croppedWidth = width - left - right;
+        int croppedHeight = height - top - bottom;
+        if (croppedWidth % 2) --croppedWidth;
+        if (croppedHeight % 2) --croppedHeight;
+        return QRect(left, top, qMax(2, croppedWidth), qMax(2, croppedHeight));
+    }
+
+    void autoCropBorders()
+    {
+        if (!leftInfo.valid() || !rightInfo.valid()) return;
+        const int width = qMin(leftInfo.displayWidth, rightInfo.displayWidth);
+        const int height = qMin(leftInfo.displayHeight, rightInfo.displayHeight);
+        auto transformedBounds = [width, height](const EyeControls &ui) {
+            const double zoom = ui.zoom->value() / 100.0;
+            const int transformedWidth = qMax(2, qRound((width * zoom) / 2.0) * 2);
+            const int transformedHeight = qMax(2, qRound((height * zoom) / 2.0) * 2);
+            const int x = (width - transformedWidth) / 2 + ui.x->value();
+            const int y = (height - transformedHeight) / 2 + ui.y->value();
+            return QRect(x, y, transformedWidth, transformedHeight);
+        };
+        const QRect leftBounds = transformedBounds(leftUi);
+        const QRect rightBounds = transformedBounds(rightUi);
+        const int commonLeft = qMax(0, qMax(leftBounds.left(), rightBounds.left()));
+        const int commonTop = qMax(0, qMax(leftBounds.top(), rightBounds.top()));
+        const int commonRight = qMin(width, qMin(leftBounds.x() + leftBounds.width(),
+                                                 rightBounds.x() + rightBounds.width()));
+        const int commonBottom = qMin(height, qMin(leftBounds.y() + leftBounds.height(),
+                                                   rightBounds.y() + rightBounds.height()));
+        if (commonRight - commonLeft < 2 || commonBottom - commonTop < 2) {
+            QMessageBox::warning(this, "Cannot auto crop",
+                                 "The transformed videos do not have a usable common image area.");
+            return;
+        }
+        cropLeft->setValue(commonLeft);
+        cropRight->setValue(width - commonRight);
+        cropTop->setValue(commonTop);
+        cropBottom->setValue(height - commonBottom);
+        const QRect crop = effectiveCropRect(width, height);
+        cropRight->setValue(width - crop.x() - crop.width());
+        cropBottom->setValue(height - crop.y() - crop.height());
+        status->setText(QString("Auto crop: %1 × %2 per eye").arg(crop.width()).arg(crop.height()));
     }
 
     static QImage alignedImage(const QImage &source, int x, int y, double zoomPercent,
@@ -890,29 +989,39 @@ private:
         QImage rightRaw = extractFrame(rightInfo, rightUi.frame->value(), decodeWidth);
         QImage left = alignedImage(leftRaw, leftUi.x->value(), leftUi.y->value(), leftUi.zoom->value(), canvasW, canvasH, canvas);
         QImage right = alignedImage(rightRaw, rightUi.x->value(), rightUi.y->value(), rightUi.zoom->value(), canvasW, canvasH, canvas);
+        const QRect sourceCrop = effectiveCropRect(canvasW, canvasH);
+        const int previewLeft = qRound(sourceCrop.left() * canvas.width() / static_cast<double>(canvasW));
+        const int previewTop = qRound(sourceCrop.top() * canvas.height() / static_cast<double>(canvasH));
+        const int previewRight = qRound((sourceCrop.x() + sourceCrop.width()) * canvas.width() / static_cast<double>(canvasW));
+        const int previewBottom = qRound((sourceCrop.y() + sourceCrop.height()) * canvas.height() / static_cast<double>(canvasH));
+        const QRect previewCrop(previewLeft, previewTop, qMax(1, previewRight - previewLeft),
+                                qMax(1, previewBottom - previewTop));
+        left = left.copy(previewCrop.intersected(left.rect()));
+        right = right.copy(previewCrop.intersected(right.rect()));
+        const QSize croppedCanvas = left.size();
 
         if (previewMode->currentIndex() == 0) {
             // Keep portrait eyes as a compact centered pair instead of stretching
             // their labels across the full width of the window.
-            leftPreview->setFixedSize(canvas);
-            rightPreview->setFixedSize(canvas);
+            leftPreview->setFixedSize(croppedCanvas);
+            rightPreview->setFixedSize(croppedCanvas);
             leftPreview->setPixmap(QPixmap::fromImage(left));
             rightPreview->setPixmap(QPixmap::fromImage(right));
         } else {
-            QImage combined(canvas, QImage::Format_RGB32);
+            QImage combined(croppedCanvas, QImage::Format_RGB32);
             if (previewMode->currentIndex() == 1) {
-                for (int y = 0; y < canvas.height(); ++y) {
+                for (int y = 0; y < croppedCanvas.height(); ++y) {
                     const QRgb *l = reinterpret_cast<const QRgb*>(left.constScanLine(y));
                     const QRgb *r = reinterpret_cast<const QRgb*>(right.constScanLine(y));
                     QRgb *out = reinterpret_cast<QRgb*>(combined.scanLine(y));
-                    for (int x = 0; x < canvas.width(); ++x) out[x] = qRgb(qGray(l[x]), qGreen(r[x]), qBlue(r[x]));
+                    for (int x = 0; x < croppedCanvas.width(); ++x) out[x] = qRgb(qGray(l[x]), qGreen(r[x]), qBlue(r[x]));
                 }
             } else {
-                for (int y = 0; y < canvas.height(); ++y) {
+                for (int y = 0; y < croppedCanvas.height(); ++y) {
                     const QRgb *l = reinterpret_cast<const QRgb*>(left.constScanLine(y));
                     const QRgb *r = reinterpret_cast<const QRgb*>(right.constScanLine(y));
                     QRgb *out = reinterpret_cast<QRgb*>(combined.scanLine(y));
-                    for (int x = 0; x < canvas.width(); ++x) {
+                    for (int x = 0; x < croppedCanvas.width(); ++x) {
                         const int d = (qAbs(qRed(l[x])-qRed(r[x])) + qAbs(qGreen(l[x])-qGreen(r[x])) + qAbs(qBlue(l[x])-qBlue(r[x]))) / 3;
                         out[x] = qRgb(d, d, d);
                     }
@@ -935,10 +1044,13 @@ private:
         const double remaining = qMin(leftInfo.duration - lt, rightInfo.duration - rt);
         const QString layout = QString("%1 preview").arg(
             leftInfo.displayHeight > leftInfo.displayWidth ? "Portrait" : "Landscape");
-        syncSummary->setText(QString("%1  •  L frame %2 @ %3, zoom %4%  •  R frame %5 @ %6, zoom %7%  •  Offset R−L: %8 s  •  Export: %9")
+        const QRect crop = effectiveCropRect(qMin(leftInfo.displayWidth, rightInfo.displayWidth),
+                                             qMin(leftInfo.displayHeight, rightInfo.displayHeight));
+        syncSummary->setText(QString("%1  •  L frame %2 @ %3, zoom %4%  •  R frame %5 @ %6, zoom %7%  •  Crop %8×%9  •  Offset R−L: %10 s  •  Export: %11")
             .arg(layout)
             .arg(leftUi.frame->value()).arg(secondsText(lt)).arg(leftUi.zoom->value(), 0, 'f', 1)
             .arg(rightUi.frame->value()).arg(secondsText(rt)).arg(rightUi.zoom->value(), 0, 'f', 1)
+            .arg(crop.width()).arg(crop.height())
             .arg(rt - lt, 0, 'f', 3).arg(secondsText(remaining)));
     }
 
@@ -959,6 +1071,7 @@ private:
 
         const int width = qMin(leftInfo.displayWidth, rightInfo.displayWidth);
         const int height = qMin(leftInfo.displayHeight, rightInfo.displayHeight);
+        const QRect crop = effectiveCropRect(width, height);
         const double fps = qMin(leftInfo.fps, rightInfo.fps);
         auto eyeChain = [&](int input, double start, int x, int y, double zoomPercent, const QString &name) {
             const double zoom = zoomPercent / 100.0;
@@ -968,13 +1081,15 @@ private:
             const int centeredY = (height - zoomHeight) / 2 + y;
             return QString("[%1:v]trim=start=%2:duration=%3,setpts=PTS-STARTPTS,scale=%4:%5,setsar=1,fps=%6[eye%7];")
                 .arg(input).arg(start, 0, 'f', 6).arg(exportDuration, 0, 'f', 6).arg(zoomWidth).arg(zoomHeight).arg(fps, 0, 'f', 6).arg(name)
-                + QString("color=c=black:s=%1x%2:r=%3:d=%4[base%5];[base%5][eye%5]overlay=x=%6:y=%7:shortest=1[%5]")
-                .arg(width).arg(height).arg(fps, 0, 'f', 6).arg(exportDuration, 0, 'f', 6).arg(name).arg(centeredX).arg(centeredY);
+                + QString("color=c=black:s=%1x%2:r=%3:d=%4[base%5];[base%5][eye%5]overlay=x=%6:y=%7:shortest=1[placed%5];"
+                          "[placed%5]crop=%8:%9:%10:%11[%5]")
+                .arg(width).arg(height).arg(fps, 0, 'f', 6).arg(exportDuration, 0, 'f', 6).arg(name)
+                .arg(centeredX).arg(centeredY).arg(crop.width()).arg(crop.height()).arg(crop.x()).arg(crop.y());
         };
         QString filter = eyeChain(0, leftStart, leftUi.x->value(), leftUi.y->value(), leftUi.zoom->value(), "l") + ";"
                        + eyeChain(1, rightStart, rightUi.x->value(), rightUi.y->value(), rightUi.zoom->value(), "r") + ";";
         if (outputMode->currentIndex() == 0) filter += "[l][r]hstack[v]";
-        else if (outputMode->currentIndex() == 1) filter += QString("[l][r]hstack,scale=%1:%2[v]").arg(width).arg(height);
+        else if (outputMode->currentIndex() == 1) filter += QString("[l][r]hstack,scale=%1:%2[v]").arg(crop.width()).arg(crop.height());
         else filter += "[l][r]hstack[sbs];[sbs]stereo3d=sbsl:arcd[v]";
 
         bool mapAudio = false;
