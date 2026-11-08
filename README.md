@@ -9,6 +9,8 @@ Stereo Aligner is a Qt 6 Widgets application for synchronizing and aligning two 
 - Optional linked stepping for moving both timelines together.
 - Independent horizontal (X) and vertical (Y) alignment for both eyes.
 - Automatic portrait/landscape detection with compact side-by-side portrait previews.
+- Preview-first workspace with a StereoMask-style left icon rail and dockable, scrollable controls drawer.
+- Independent 25–400% center zoom for each camera to compensate for different lenses and fields of view; zoom is included in export.
 - Side-by-side, red/cyan anaglyph, and difference previews.
 - Light and dark themes, with light selected by default.
 - English/US number formatting independent of Windows regional settings.

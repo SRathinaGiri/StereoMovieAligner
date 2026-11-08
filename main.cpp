@@ -28,6 +28,7 @@ struct EyeControls
     QSpinBox *frame = nullptr;
     QSpinBox *x = nullptr;
     QSpinBox *y = nullptr;
+    QDoubleSpinBox *zoom = nullptr;
 };
 
 class StereoAlignerWindow final : public QMainWindow
@@ -54,6 +55,9 @@ public:
         setMinimumSize(1050, 720);
         setAcceptDrops(true);
         updateReadyState();
+        QSettings windowSettings;
+        restoreGeometry(windowSettings.value("window/geometry").toByteArray());
+        restoreState(windowSettings.value("window/state").toByteArray(), 1);
 
         const QStringList arguments = QCoreApplication::arguments();
         if (arguments.size() > 1) {
@@ -65,6 +69,14 @@ public:
     }
 
 protected:
+    void closeEvent(QCloseEvent *event) override
+    {
+        QSettings settings;
+        settings.setValue("window/geometry", saveGeometry());
+        settings.setValue("window/state", saveState(1));
+        QMainWindow::closeEvent(event);
+    }
+
     void resizeEvent(QResizeEvent *event) override
     {
         QMainWindow::resizeEvent(event);
@@ -140,11 +152,13 @@ private:
             setStyleSheet(R"(
                 QMainWindow, QWidget { background: #11161e; color: #e7edf5; font-size: 13px; }
                 QLabel#title { font-size: 28px; font-weight: 700; color: #ffffff; }
+                QLabel#drawerTitle { font-size: 21px; font-weight: 700; color: #ffffff; }
+                QLabel#workspaceTitle { font-size: 17px; font-weight: 650; color: #e7edf5; }
                 QLabel#subtitle, QLabel#details { color: #8fa1b7; }
                 QLabel#summary { color: #a9bad0; padding: 3px; }
                 QGroupBox { border: 1px solid #2c3949; border-radius: 7px; margin-top: 9px; padding-top: 11px; font-weight: 600; }
                 QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #9fb4cb; }
-                QPushButton, QComboBox, QSpinBox { background: #202a37; border: 1px solid #39495c; border-radius: 5px; padding: 6px 9px; }
+                QPushButton, QComboBox, QSpinBox, QDoubleSpinBox { background: #202a37; border: 1px solid #39495c; border-radius: 5px; padding: 6px 9px; }
                 QPushButton:hover { background: #2a3949; border-color: #5b7692; }
                 QPushButton:disabled { color: #657181; background: #19212b; }
                 QPushButton#primaryButton { background: #1769aa; border-color: #3187c9; color: white; font-weight: 700; }
@@ -153,17 +167,21 @@ private:
                 QSlider::handle:horizontal { width: 15px; margin: -5px 0; border-radius: 7px; background: #42a5e8; }
                 QProgressBar { border: 1px solid #344253; border-radius: 4px; background: #19212b; text-align: center; }
                 QProgressBar::chunk { background: #287eb9; }
+                QDockWidget::title { background: #202a37; padding: 6px; }
+                QToolBar { background: #19212b; border-right: 1px solid #39495c; spacing: 5px; padding: 4px; }
                 QToolTip { background: #273342; color: white; border: 1px solid #5b6c80; }
             )");
         } else {
             setStyleSheet(R"(
                 QMainWindow, QWidget { background: #f5f7fa; color: #182433; font-size: 13px; }
                 QLabel#title { font-size: 28px; font-weight: 700; color: #132033; }
+                QLabel#drawerTitle { font-size: 21px; font-weight: 700; color: #132033; }
+                QLabel#workspaceTitle { font-size: 17px; font-weight: 650; color: #24364a; }
                 QLabel#subtitle, QLabel#details { color: #5e7085; }
                 QLabel#summary { color: #465b72; padding: 3px; }
                 QGroupBox { border: 1px solid #cbd5e1; border-radius: 7px; margin-top: 9px; padding-top: 11px; font-weight: 600; background: #ffffff; }
                 QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #41566e; background: #f5f7fa; }
-                QPushButton, QComboBox, QSpinBox { background: #ffffff; border: 1px solid #b9c6d4; border-radius: 5px; padding: 6px 9px; }
+                QPushButton, QComboBox, QSpinBox, QDoubleSpinBox { background: #ffffff; border: 1px solid #b9c6d4; border-radius: 5px; padding: 6px 9px; }
                 QPushButton:hover { background: #edf4fa; border-color: #7195b7; }
                 QPushButton:disabled { color: #9aa7b4; background: #edf0f3; }
                 QPushButton#primaryButton { background: #1672b8; border-color: #12639f; color: white; font-weight: 700; }
@@ -172,6 +190,8 @@ private:
                 QSlider::handle:horizontal { width: 15px; margin: -5px 0; border-radius: 7px; background: #1672b8; }
                 QProgressBar { border: 1px solid #b9c6d4; border-radius: 4px; background: #ffffff; text-align: center; }
                 QProgressBar::chunk { background: #2b83bf; }
+                QDockWidget::title { background: #e7edf3; padding: 6px; }
+                QToolBar { background: #e8edf2; border-right: 1px solid #c4ced8; spacing: 5px; padding: 4px; }
                 QToolTip { background: #ffffff; color: #182433; border: 1px solid #9cabb9; }
             )");
         }
@@ -179,21 +199,18 @@ private:
 
     void buildUi()
     {
+        // Preview-first workspace. Editing controls live in a dockable side
+        // drawer, following the compact toolbox approach used by StereoMask.
         auto *root = new QWidget;
         setCentralWidget(root);
         auto *main = new QVBoxLayout(root);
-        main->setContentsMargins(14, 12, 14, 12);
-        main->setSpacing(10);
+        main->setContentsMargins(8, 8, 8, 8);
+        main->setSpacing(6);
 
         auto *header = new QHBoxLayout;
-        auto *titleBox = new QVBoxLayout;
-        auto *title = new QLabel("Stereo Aligner");
-        title->setObjectName("title");
-        auto *subtitle = new QLabel("Synchronize two cameras frame-by-frame, then correct horizontal and vertical alignment.");
-        subtitle->setObjectName("subtitle");
-        titleBox->addWidget(title);
-        titleBox->addWidget(subtitle);
-        header->addLayout(titleBox);
+        auto *workspaceTitle = new QLabel("Stereo workspace");
+        workspaceTitle->setObjectName("workspaceTitle");
+        header->addWidget(workspaceTitle);
         header->addStretch();
         previewMode = new QComboBox;
         previewMode->addItems({"Side by side", "Red / cyan anaglyph", "Difference"});
@@ -205,11 +222,6 @@ private:
         header->addWidget(new QLabel("Theme:"));
         header->addWidget(themeSelector);
         main->addLayout(header);
-
-        auto *fileRow = new QHBoxLayout;
-        fileRow->addWidget(makeFileCard(true), 1);
-        fileRow->addWidget(makeFileCard(false), 1);
-        main->addLayout(fileRow);
 
         previewStack = new QStackedWidget;
         previewStack->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
@@ -227,30 +239,61 @@ private:
         previewStack->addWidget(singlePreview);
         main->addWidget(previewStack, 1);
 
-        auto *timelines = new QHBoxLayout;
-        timelines->addWidget(makeTimelineCard(true), 1);
-        timelines->addWidget(makeTimelineCard(false), 1);
-        main->addLayout(timelines);
+        syncSummary = new QLabel("Load both videos to begin.");
+        syncSummary->setObjectName("summary");
+        main->addWidget(syncSummary);
+        auto *statusRow = new QHBoxLayout;
+        progress = new QProgressBar;
+        progress->setRange(0, 1000);
+        progress->setValue(0);
+        status = new QLabel(ffmpegPath.isEmpty() ? "FFmpeg not found" : "Ready");
+        status->setMinimumWidth(180);
+        statusRow->addWidget(progress, 1);
+        statusRow->addWidget(status);
+        main->addLayout(statusRow);
 
-        auto *bottom = new QHBoxLayout;
-        auto *alignGroup = new QGroupBox("Alignment (pixels at source resolution)");
+        auto *drawer = new QWidget;
+        auto *drawerLayout = new QVBoxLayout(drawer);
+        drawerLayout->setContentsMargins(8, 8, 8, 8);
+        drawerLayout->setSpacing(7);
+        auto *title = new QLabel("Stereo Aligner");
+        title->setObjectName("drawerTitle");
+        auto *subtitle = new QLabel("Load, synchronize, align and export");
+        subtitle->setObjectName("subtitle");
+        subtitle->setWordWrap(true);
+        drawerLayout->addWidget(title);
+        drawerLayout->addWidget(subtitle);
+        drawerLayout->addWidget(makeFileCard(true));
+        drawerLayout->addWidget(makeFileCard(false));
+        drawerLayout->addWidget(makeTimelineCard(true));
+        drawerLayout->addWidget(makeTimelineCard(false));
+
+        auto *alignGroup = new QGroupBox("Transform");
         auto *align = new QGridLayout(alignGroup);
+        align->setColumnStretch(1, 1);
+        align->setColumnStretch(2, 1);
         align->addWidget(new QLabel("Eye"), 0, 0);
-        align->addWidget(new QLabel("X  (left / right)"), 0, 1);
-        align->addWidget(new QLabel("Y  (up / down)"), 0, 2);
+        align->addWidget(new QLabel("Left / right"), 0, 1);
+        align->addWidget(new QLabel("Up / down"), 0, 2);
         setupOffsetSpin(leftUi.x);
         setupOffsetSpin(leftUi.y);
         setupOffsetSpin(rightUi.x);
         setupOffsetSpin(rightUi.y);
+        setupZoomSpin(leftUi.zoom);
+        setupZoomSpin(rightUi.zoom);
         align->addWidget(new QLabel("Left"), 1, 0);
         align->addWidget(leftUi.x, 1, 1);
         align->addWidget(leftUi.y, 1, 2);
-        align->addWidget(new QLabel("Right"), 2, 0);
-        align->addWidget(rightUi.x, 2, 1);
-        align->addWidget(rightUi.y, 2, 2);
-        resetAlignment = new QPushButton("Reset alignment");
-        align->addWidget(resetAlignment, 3, 0, 1, 3);
-        bottom->addWidget(alignGroup, 2);
+        align->addWidget(new QLabel("Zoom"), 2, 0);
+        align->addWidget(leftUi.zoom, 2, 1, 1, 2);
+        align->addWidget(new QLabel("Right"), 3, 0);
+        align->addWidget(rightUi.x, 3, 1);
+        align->addWidget(rightUi.y, 3, 2);
+        align->addWidget(new QLabel("Zoom"), 4, 0);
+        align->addWidget(rightUi.zoom, 4, 1, 1, 2);
+        resetAlignment = new QPushButton("Reset transforms");
+        align->addWidget(resetAlignment, 5, 0, 1, 3);
+        drawerLayout->addWidget(alignGroup);
 
         auto *exportGroup = new QGroupBox("Output");
         auto *exportGrid = new QGridLayout(exportGroup);
@@ -268,28 +311,47 @@ private:
         cancelButton->setVisible(false);
         exportGrid->addWidget(exportButton, 2, 0, 1, 2);
         exportGrid->addWidget(cancelButton, 3, 0, 1, 2);
-        bottom->addWidget(exportGroup, 2);
+        drawerLayout->addWidget(exportGroup);
 
-        auto *helpGroup = new QGroupBox("Quick controls");
-        auto *help = new QVBoxLayout(helpGroup);
-        help->addWidget(new QLabel("A / D   Left frame − / +\nJ / L   Right frame − / +\nCtrl + arrows   Left X/Y\nAlt + arrows    Right X/Y\nShift = 10-pixel nudge"));
-        help->addStretch();
-        bottom->addWidget(helpGroup, 2);
-        main->addLayout(bottom);
+        auto *shortcutHint = new QLabel("A/D: left frame   J/L: right frame\nCtrl+arrows: left XY   Alt+arrows: right XY");
+        shortcutHint->setObjectName("details");
+        shortcutHint->setWordWrap(true);
+        drawerLayout->addWidget(shortcutHint);
+        drawerLayout->addStretch();
 
-        syncSummary = new QLabel("Load both videos to begin.");
-        syncSummary->setObjectName("summary");
-        main->addWidget(syncSummary);
-        auto *statusRow = new QHBoxLayout;
-        progress = new QProgressBar;
-        progress->setRange(0, 1000);
-        progress->setValue(0);
-        status = new QLabel(ffmpegPath.isEmpty() ? "FFmpeg not found" : "Ready");
-        status->setMinimumWidth(280);
-        statusRow->addWidget(progress, 1);
-        statusRow->addWidget(status);
-        main->addLayout(statusRow);
+        auto *scroll = new QScrollArea;
+        scroll->setWidgetResizable(true);
+        scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        scroll->setFrameShape(QFrame::NoFrame);
+        scroll->setWidget(drawer);
+        auto *controlsDock = new QDockWidget("Controls", this);
+        controlsDock->setObjectName("controlsDock");
+        controlsDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+        controlsDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable | QDockWidget::DockWidgetClosable);
+        controlsDock->setWidget(scroll);
+        controlsDock->setMinimumWidth(310);
+        controlsDock->resize(340, height());
+        addDockWidget(Qt::LeftDockWidgetArea, controlsDock);
 
+        auto *rail = new QToolBar("Toolbox rail", this);
+        rail->setObjectName("toolboxRail");
+        rail->setAllowedAreas(Qt::LeftToolBarArea);
+        rail->setMovable(false);
+        rail->setIconSize(QSize(24, 24));
+        rail->setToolButtonStyle(Qt::ToolButtonIconOnly);
+        addToolBar(Qt::LeftToolBarArea, rail);
+        QAction *drawerAction = controlsDock->toggleViewAction();
+        drawerAction->setIcon(style()->standardIcon(QStyle::SP_FileDialogDetailedView));
+        drawerAction->setToolTip("Show or hide controls");
+        rail->addAction(drawerAction);
+        rail->addSeparator();
+        QAction *openLeftAction = rail->addAction(style()->standardIcon(QStyle::SP_DialogOpenButton), "Open left video");
+        QAction *openRightAction = rail->addAction(style()->standardIcon(QStyle::SP_DirOpenIcon), "Open right video");
+        rail->addSeparator();
+        QAction *exportAction = rail->addAction(style()->standardIcon(QStyle::SP_DialogSaveButton), "Export aligned video");
+        connect(openLeftAction, &QAction::triggered, this, [this] { chooseVideo(true); });
+        connect(openRightAction, &QAction::triggered, this, [this] { chooseVideo(false); });
+        connect(exportAction, &QAction::triggered, this, [this] { startExport(); });
     }
 
     QWidget *makeFileCard(bool left)
@@ -300,12 +362,13 @@ private:
         ui.open = new QPushButton(left ? "Open left video…" : "Open right video…");
         ui.fileName = new QLabel("No video loaded");
         ui.fileName->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        ui.fileName->setWordWrap(true);
         ui.details = new QLabel("—");
         ui.details->setObjectName("details");
-        layout->addWidget(ui.open, 0, 0);
-        layout->addWidget(ui.fileName, 0, 1);
-        layout->addWidget(ui.details, 1, 0, 1, 2);
-        layout->setColumnStretch(1, 1);
+        ui.details->setWordWrap(true);
+        layout->addWidget(ui.open, 0, 0, 1, 2);
+        layout->addWidget(ui.fileName, 1, 0, 1, 2);
+        layout->addWidget(ui.details, 2, 0, 1, 2);
         return box;
     }
 
@@ -325,12 +388,14 @@ private:
         if (left) {
             linkStepping = new QCheckBox("Link stepping");
             linkStepping->setToolTip("Previous/Next buttons move both videos by one frame.");
-            layout->addWidget(linkStepping, 0, 2);
+            layout->addWidget(linkStepping, 1, 0, 1, 2);
         } else {
-            layout->addWidget(new QLabel("Independent by default"), 0, 2);
+            auto *independent = new QLabel("Independent by default");
+            independent->setObjectName("details");
+            layout->addWidget(independent, 1, 0, 1, 2);
         }
-        layout->addWidget(ui.slider, 1, 0, 1, 2);
-        layout->addWidget(ui.frame, 1, 2);
+        layout->addWidget(ui.slider, 2, 0, 1, 2);
+        layout->addWidget(ui.frame, 3, 0, 1, 2);
         layout->setColumnStretch(1, 1);
         return box;
     }
@@ -353,6 +418,18 @@ private:
         spin->setKeyboardTracking(false);
     }
 
+    static void setupZoomSpin(QDoubleSpinBox *&spin)
+    {
+        spin = new QDoubleSpinBox;
+        spin->setRange(25.0, 400.0);
+        spin->setDecimals(1);
+        spin->setSingleStep(0.5);
+        spin->setValue(100.0);
+        spin->setSuffix(" %");
+        spin->setKeyboardTracking(false);
+        spin->setToolTip("Scale this camera around the center. Below 100% zooms out; above 100% zooms in.");
+    }
+
     void connectUi()
     {
         connect(leftUi.open, &QPushButton::clicked, this, [this] { chooseVideo(true); });
@@ -366,6 +443,8 @@ private:
         connectTimeline(rightUi);
         for (QSpinBox *spin : {leftUi.x, leftUi.y, rightUi.x, rightUi.y})
             connect(spin, &QSpinBox::valueChanged, this, [this] { updateSummary(); requestPreview(); });
+        for (QDoubleSpinBox *spin : {leftUi.zoom, rightUi.zoom})
+            connect(spin, &QDoubleSpinBox::valueChanged, this, [this] { updateSummary(); requestPreview(); });
 
         connect(previewMode, &QComboBox::currentIndexChanged, this, [this] {
             previewStack->setCurrentIndex(previewMode->currentIndex() == 0 ? 0 : 1);
@@ -378,6 +457,7 @@ private:
         connect(resetAlignment, &QPushButton::clicked, this, [this] {
             leftUi.x->setValue(0); leftUi.y->setValue(0);
             rightUi.x->setValue(0); rightUi.y->setValue(0);
+            leftUi.zoom->setValue(100.0); rightUi.zoom->setValue(100.0);
         });
         connect(exportButton, &QPushButton::clicked, this, [this] { startExport(); });
         connect(cancelButton, &QPushButton::clicked, this, [this] {
@@ -512,8 +592,8 @@ private:
     {
         const bool leftReady = leftInfo.valid();
         const bool rightReady = rightInfo.valid();
-        const QList<QWidget*> leftWidgets {leftUi.previous, leftUi.next, leftUi.slider, leftUi.frame, leftUi.x, leftUi.y};
-        const QList<QWidget*> rightWidgets {rightUi.previous, rightUi.next, rightUi.slider, rightUi.frame, rightUi.x, rightUi.y};
+        const QList<QWidget*> leftWidgets {leftUi.previous, leftUi.next, leftUi.slider, leftUi.frame, leftUi.x, leftUi.y, leftUi.zoom};
+        const QList<QWidget*> rightWidgets {rightUi.previous, rightUi.next, rightUi.slider, rightUi.frame, rightUi.x, rightUi.y, rightUi.zoom};
         for (QWidget *w : leftWidgets) w->setEnabled(leftReady);
         for (QWidget *w : rightWidgets) w->setEnabled(rightReady);
         exportButton->setEnabled(leftReady && rightReady && !exportProcess);
@@ -557,17 +637,21 @@ private:
         return image;
     }
 
-    static QImage alignedImage(const QImage &source, int x, int y, int fullWidth, int fullHeight, QSize canvas)
+    static QImage alignedImage(const QImage &source, int x, int y, double zoomPercent,
+                               int fullWidth, int fullHeight, QSize canvas)
     {
         QImage result(canvas, QImage::Format_RGB32);
         result.fill(Qt::black);
         if (source.isNull() || fullWidth <= 0 || fullHeight <= 0) return result;
         const double sx = canvas.width() / static_cast<double>(fullWidth);
         const double sy = canvas.height() / static_cast<double>(fullHeight);
+        const double zoom = zoomPercent / 100.0;
         QPainter painter(&result);
         painter.setRenderHint(QPainter::SmoothPixmapTransform);
-        const QSize target(qRound(fullWidth * sx), qRound(fullHeight * sy));
-        painter.drawImage(QRect(qRound(x * sx), qRound(y * sy), target.width(), target.height()), source);
+        const QSize target(qMax(1, qRound(canvas.width() * zoom)), qMax(1, qRound(canvas.height() * zoom)));
+        const int drawX = qRound((canvas.width() - target.width()) / 2.0 + x * sx);
+        const int drawY = qRound((canvas.height() - target.height()) / 2.0 + y * sy);
+        painter.drawImage(QRect(drawX, drawY, target.width(), target.height()), source);
         return result;
     }
 
@@ -588,8 +672,8 @@ private:
         const int decodeWidth = qMin(1600, qMax(2, canvas.width()));
         QImage leftRaw = extractFrame(leftInfo, leftUi.frame->value(), decodeWidth);
         QImage rightRaw = extractFrame(rightInfo, rightUi.frame->value(), decodeWidth);
-        QImage left = alignedImage(leftRaw, leftUi.x->value(), leftUi.y->value(), canvasW, canvasH, canvas);
-        QImage right = alignedImage(rightRaw, rightUi.x->value(), rightUi.y->value(), canvasW, canvasH, canvas);
+        QImage left = alignedImage(leftRaw, leftUi.x->value(), leftUi.y->value(), leftUi.zoom->value(), canvasW, canvasH, canvas);
+        QImage right = alignedImage(rightRaw, rightUi.x->value(), rightUi.y->value(), rightUi.zoom->value(), canvasW, canvasH, canvas);
 
         if (previewMode->currentIndex() == 0) {
             // Keep portrait eyes as a compact centered pair instead of stretching
@@ -635,9 +719,10 @@ private:
         const double remaining = qMin(leftInfo.duration - lt, rightInfo.duration - rt);
         const QString layout = QString("%1 preview").arg(
             leftInfo.displayHeight > leftInfo.displayWidth ? "Portrait" : "Landscape");
-        syncSummary->setText(QString("%1  •  Selected pair  •  Left %2 @ %3  •  Right %4 @ %5  •  Offset R−L: %6 s  •  Export length: %7")
+        syncSummary->setText(QString("%1  •  L frame %2 @ %3, zoom %4%  •  R frame %5 @ %6, zoom %7%  •  Offset R−L: %8 s  •  Export: %9")
             .arg(layout)
-            .arg(leftUi.frame->value()).arg(secondsText(lt)).arg(rightUi.frame->value()).arg(secondsText(rt))
+            .arg(leftUi.frame->value()).arg(secondsText(lt)).arg(leftUi.zoom->value(), 0, 'f', 1)
+            .arg(rightUi.frame->value()).arg(secondsText(rt)).arg(rightUi.zoom->value(), 0, 'f', 1)
             .arg(rt - lt, 0, 'f', 3).arg(secondsText(remaining)));
     }
 
@@ -659,14 +744,19 @@ private:
         const int width = qMin(leftInfo.displayWidth, rightInfo.displayWidth);
         const int height = qMin(leftInfo.displayHeight, rightInfo.displayHeight);
         const double fps = qMin(leftInfo.fps, rightInfo.fps);
-        auto eyeChain = [&](int input, double start, int x, int y, const QString &name) {
+        auto eyeChain = [&](int input, double start, int x, int y, double zoomPercent, const QString &name) {
+            const double zoom = zoomPercent / 100.0;
+            const int zoomWidth = qMax(2, qRound((width * zoom) / 2.0) * 2);
+            const int zoomHeight = qMax(2, qRound((height * zoom) / 2.0) * 2);
+            const int centeredX = (width - zoomWidth) / 2 + x;
+            const int centeredY = (height - zoomHeight) / 2 + y;
             return QString("[%1:v]trim=start=%2:duration=%3,setpts=PTS-STARTPTS,scale=%4:%5,setsar=1,fps=%6[eye%7];")
-                .arg(input).arg(start, 0, 'f', 6).arg(exportDuration, 0, 'f', 6).arg(width).arg(height).arg(fps, 0, 'f', 6).arg(name)
+                .arg(input).arg(start, 0, 'f', 6).arg(exportDuration, 0, 'f', 6).arg(zoomWidth).arg(zoomHeight).arg(fps, 0, 'f', 6).arg(name)
                 + QString("color=c=black:s=%1x%2:r=%3:d=%4[base%5];[base%5][eye%5]overlay=x=%6:y=%7:shortest=1[%5]")
-                .arg(width).arg(height).arg(fps, 0, 'f', 6).arg(exportDuration, 0, 'f', 6).arg(name).arg(x).arg(y);
+                .arg(width).arg(height).arg(fps, 0, 'f', 6).arg(exportDuration, 0, 'f', 6).arg(name).arg(centeredX).arg(centeredY);
         };
-        QString filter = eyeChain(0, leftStart, leftUi.x->value(), leftUi.y->value(), "l") + ";"
-                       + eyeChain(1, rightStart, rightUi.x->value(), rightUi.y->value(), "r") + ";";
+        QString filter = eyeChain(0, leftStart, leftUi.x->value(), leftUi.y->value(), leftUi.zoom->value(), "l") + ";"
+                       + eyeChain(1, rightStart, rightUi.x->value(), rightUi.y->value(), rightUi.zoom->value(), "r") + ";";
         if (outputMode->currentIndex() == 0) filter += "[l][r]hstack[v]";
         else if (outputMode->currentIndex() == 1) filter += QString("[l][r]hstack,scale=%1:%2[v]").arg(width).arg(height);
         else filter += "[l][r]hstack[sbs];[sbs]stereo3d=sbsl:arcd[v]";
