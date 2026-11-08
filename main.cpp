@@ -1,4 +1,9 @@
 #include <QtWidgets>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/features2d.hpp>
+#include <opencv2/imgproc.hpp>
+#include <algorithm>
 #include <cmath>
 
 struct VideoInfo
@@ -29,6 +34,17 @@ struct EyeControls
     QSpinBox *x = nullptr;
     QSpinBox *y = nullptr;
     QDoubleSpinBox *zoom = nullptr;
+};
+
+struct AlignmentEstimate
+{
+    double scale = 1.0;
+    double x = 0.0;
+    double y = 0.0;
+    double rotationDegrees = 0.0;
+    int matches = 0;
+    int inliers = 0;
+    bool valid = false;
 };
 
 class StereoAlignerWindow final : public QMainWindow
@@ -114,6 +130,7 @@ private:
     QComboBox *audioSource = nullptr;
     QCheckBox *linkStepping = nullptr;
     QPushButton *resetAlignment = nullptr;
+    QPushButton *autoAlignButton = nullptr;
     QPushButton *exportButton = nullptr;
     QPushButton *cancelButton = nullptr;
     QProgressBar *progress = nullptr;
@@ -291,8 +308,11 @@ private:
         align->addWidget(rightUi.y, 3, 2);
         align->addWidget(new QLabel("Zoom"), 4, 0);
         align->addWidget(rightUi.zoom, 4, 1, 1, 2);
+        autoAlignButton = new QPushButton("Auto align selected frames");
+        autoAlignButton->setToolTip("Estimate relative zoom and X/Y alignment from matched features in nearby frame pairs.");
+        align->addWidget(autoAlignButton, 5, 0, 1, 3);
         resetAlignment = new QPushButton("Reset transforms");
-        align->addWidget(resetAlignment, 5, 0, 1, 3);
+        align->addWidget(resetAlignment, 6, 0, 1, 3);
         drawerLayout->addWidget(alignGroup);
 
         auto *exportGroup = new QGroupBox("Output");
@@ -459,6 +479,7 @@ private:
             rightUi.x->setValue(0); rightUi.y->setValue(0);
             leftUi.zoom->setValue(100.0); rightUi.zoom->setValue(100.0);
         });
+        connect(autoAlignButton, &QPushButton::clicked, this, [this] { autoAlign(); });
         connect(exportButton, &QPushButton::clicked, this, [this] { startExport(); });
         connect(cancelButton, &QPushButton::clicked, this, [this] {
             if (exportProcess) {
@@ -597,6 +618,7 @@ private:
         for (QWidget *w : leftWidgets) w->setEnabled(leftReady);
         for (QWidget *w : rightWidgets) w->setEnabled(rightReady);
         exportButton->setEnabled(leftReady && rightReady && !exportProcess);
+        autoAlignButton->setEnabled(leftReady && rightReady && !exportProcess);
         resetAlignment->setEnabled(leftReady || rightReady);
         updateSummary();
     }
@@ -635,6 +657,200 @@ private:
         QImage image;
         image.loadFromData(process.readAllStandardOutput(), "PNG");
         return image;
+    }
+
+    static cv::Mat grayMat(const QImage &image)
+    {
+        const QImage rgb = image.convertToFormat(QImage::Format_RGB888);
+        cv::Mat wrapped(rgb.height(), rgb.width(), CV_8UC3,
+                        const_cast<uchar*>(rgb.constBits()), rgb.bytesPerLine());
+        cv::Mat gray;
+        cv::cvtColor(wrapped, gray, cv::COLOR_RGB2GRAY);
+        return gray;
+    }
+
+    AlignmentEstimate estimateAlignment(const QImage &leftImage, const QImage &rightImage) const
+    {
+        AlignmentEstimate result;
+        if (leftImage.isNull() || rightImage.isNull()) return result;
+
+        cv::Mat leftGray = grayMat(leftImage);
+        cv::Mat rightGray = grayMat(rightImage);
+        if (leftGray.empty() || rightGray.empty()) return result;
+        if (rightGray.size() != leftGray.size())
+            cv::resize(rightGray, rightGray, leftGray.size(), 0.0, 0.0, cv::INTER_AREA);
+
+        // Local contrast normalization makes cross-camera exposure and tone
+        // differences less important to feature detection.
+        auto clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+        clahe->apply(leftGray, leftGray);
+        clahe->apply(rightGray, rightGray);
+
+        std::vector<cv::KeyPoint> leftKeys, rightKeys;
+        cv::Mat leftDescriptors, rightDescriptors;
+        auto sift = cv::SIFT::create(3500, 3, 0.025, 10.0, 1.6);
+        sift->detectAndCompute(leftGray, cv::noArray(), leftKeys, leftDescriptors);
+        sift->detectAndCompute(rightGray, cv::noArray(), rightKeys, rightDescriptors);
+        if (leftDescriptors.empty() || rightDescriptors.empty()) return result;
+
+        cv::BFMatcher matcher(cv::NORM_L2);
+        std::vector<std::vector<cv::DMatch>> candidates;
+        matcher.knnMatch(rightDescriptors, leftDescriptors, candidates, 2);
+        std::vector<cv::DMatch> good;
+        good.reserve(candidates.size());
+        for (const auto &pair : candidates) {
+            if (pair.size() >= 2 && pair[0].distance < 0.72f * pair[1].distance)
+                good.push_back(pair[0]);
+        }
+        if (good.size() < 18) return result;
+        std::sort(good.begin(), good.end(), [](const cv::DMatch &a, const cv::DMatch &b) {
+            return a.distance < b.distance;
+        });
+        if (good.size() > 1800) good.resize(1800);
+
+        std::vector<cv::Point2f> rightPoints, leftPoints;
+        rightPoints.reserve(good.size());
+        leftPoints.reserve(good.size());
+        for (const cv::DMatch &match : good) {
+            rightPoints.push_back(rightKeys[match.queryIdx].pt);
+            leftPoints.push_back(leftKeys[match.trainIdx].pt);
+        }
+
+        cv::Mat inlierMask;
+        cv::Mat affine = cv::estimateAffinePartial2D(
+            rightPoints, leftPoints, inlierMask, cv::RANSAC, 3.0, 5000, 0.995, 25);
+        if (affine.empty()) return result;
+        affine.convertTo(affine, CV_64F);
+        const int inliers = cv::countNonZero(inlierMask);
+        const double inlierRatio = inliers / static_cast<double>(good.size());
+        if (inliers < 18 || inlierRatio < 0.20) return result;
+
+        const double a = affine.at<double>(0, 0);
+        const double b = affine.at<double>(0, 1);
+        const double c = affine.at<double>(1, 0);
+        const double d = affine.at<double>(1, 1);
+        const double tx = affine.at<double>(0, 2);
+        const double ty = affine.at<double>(1, 2);
+        const double scale = std::sqrt(a * a + c * c);
+        const double rotation = std::atan2(c, a) * 180.0 / M_PI;
+        if (!std::isfinite(scale) || scale < 0.60 || scale > 1.60 || std::abs(rotation) > 10.0)
+            return result;
+
+        const double centerX = leftGray.cols / 2.0;
+        const double centerY = leftGray.rows / 2.0;
+        const double mappedCenterX = a * centerX + b * centerY + tx;
+        const double mappedCenterY = c * centerX + d * centerY + ty;
+        result.scale = scale;
+        result.x = (mappedCenterX - centerX) * leftInfo.displayWidth / leftGray.cols;
+        result.y = (mappedCenterY - centerY) * leftInfo.displayHeight / leftGray.rows;
+        result.rotationDegrees = rotation;
+        result.matches = static_cast<int>(good.size());
+        result.inliers = inliers;
+        result.valid = true;
+        return result;
+    }
+
+    static double medianValue(std::vector<double> values)
+    {
+        if (values.empty()) return 0.0;
+        std::sort(values.begin(), values.end());
+        const size_t middle = values.size() / 2;
+        return values.size() % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2.0;
+    }
+
+    void autoAlign()
+    {
+        if (!leftInfo.valid() || !rightInfo.valid() || exportProcess) return;
+        autoAlignButton->setEnabled(false);
+        status->setText("Finding matching features…");
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+
+        std::vector<AlignmentEstimate> estimates;
+        const int candidateOffsets[] = {0, -6, 6, -12, 12};
+        int samplesAnalyzed = 0;
+        try {
+            for (int offset : candidateOffsets) {
+                const int leftFrame = leftUi.frame->value() + offset;
+                const int rightFrame = rightUi.frame->value() + offset;
+                if (leftFrame < 0 || leftFrame >= leftInfo.totalFrames ||
+                    rightFrame < 0 || rightFrame >= rightInfo.totalFrames)
+                    continue;
+                status->setText(QString("Auto alignment sample %1 of 3…").arg(samplesAnalyzed + 1));
+                QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+                const QImage left = extractFrame(leftInfo, leftFrame, 1280);
+                const QImage right = extractFrame(rightInfo, rightFrame, 1280);
+                AlignmentEstimate estimate = estimateAlignment(left, right);
+                if (estimate.valid) estimates.push_back(estimate);
+                if (++samplesAnalyzed == 3) break;
+            }
+        } catch (const cv::Exception &error) {
+            QApplication::restoreOverrideCursor();
+            autoAlignButton->setEnabled(true);
+            status->setText("Auto alignment failed");
+            QMessageBox::warning(this, "Auto alignment failed", QString::fromUtf8(error.what()));
+            return;
+        }
+
+        QApplication::restoreOverrideCursor();
+        autoAlignButton->setEnabled(true);
+        status->setText("Ready");
+        if (estimates.empty()) {
+            QMessageBox::warning(this, "Could not auto align",
+                "Not enough reliable matching features were found. Try a frame with clear, static background detail and similar exposure in both cameras.");
+            return;
+        }
+
+        std::vector<double> scales, xs, ys, rotations, ratios;
+        int totalMatches = 0;
+        int totalInliers = 0;
+        for (const AlignmentEstimate &estimate : estimates) {
+            scales.push_back(estimate.scale);
+            xs.push_back(estimate.x);
+            ys.push_back(estimate.y);
+            rotations.push_back(estimate.rotationDegrees);
+            ratios.push_back(estimate.inliers / static_cast<double>(estimate.matches));
+            totalMatches += estimate.matches;
+            totalInliers += estimate.inliers;
+        }
+        const double scale = medianValue(scales);
+        const double x = medianValue(xs);
+        const double y = medianValue(ys);
+        const double rotation = medianValue(rotations);
+        const double ratio = medianValue(ratios);
+        const QString confidence = estimates.size() == 3 && ratio >= 0.45 ? "High" : (ratio >= 0.28 ? "Medium" : "Low");
+
+        QMessageBox box(this);
+        box.setWindowTitle("Automatic alignment result");
+        box.setIcon(QMessageBox::Information);
+        box.setTextFormat(Qt::RichText);
+        box.setText(QString(
+            "<b>Relative right-eye zoom:</b> %1%<br>"
+            "<b>Relative center shift:</b> X %2 px, Y %3 px<br>"
+            "<b>Residual rotation:</b> %4° (reported, not applied)<br>"
+            "<b>Confidence:</b> %5 — %6/%7 inliers from %8 usable frame pairs<br><br>"
+            "Choose whether to apply only the lens/zoom correction or also center the dominant matched scene plane.")
+            .arg(scale * 100.0, 0, 'f', 2).arg(x, 0, 'f', 1).arg(y, 0, 'f', 1)
+            .arg(rotation, 0, 'f', 3).arg(confidence).arg(totalInliers).arg(totalMatches).arg(estimates.size()));
+        QPushButton *applyAll = box.addButton("Apply zoom + X/Y", QMessageBox::AcceptRole);
+        QPushButton *zoomOnly = box.addButton("Apply zoom only", QMessageBox::ActionRole);
+        box.addButton(QMessageBox::Cancel);
+        box.setDefaultButton(applyAll);
+        box.exec();
+        if (box.clickedButton() != applyAll && box.clickedButton() != zoomOnly) return;
+
+        // Split the relative scale between both eyes, like stereo alignment
+        // tools that adjust both sources rather than degrading only one side.
+        const double rootScale = std::sqrt(scale);
+        leftUi.zoom->setValue(qBound(25.0, 100.0 / rootScale, 400.0));
+        rightUi.zoom->setValue(qBound(25.0, 100.0 * rootScale, 400.0));
+        if (box.clickedButton() == applyAll) {
+            leftUi.x->setValue(qRound(-x / 2.0));
+            rightUi.x->setValue(qRound(x / 2.0));
+            leftUi.y->setValue(qRound(-y / 2.0));
+            rightUi.y->setValue(qRound(y / 2.0));
+        }
+        updateSummary();
+        requestPreview();
     }
 
     static QImage alignedImage(const QImage &source, int x, int y, double zoomPercent,
