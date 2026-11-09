@@ -7,19 +7,26 @@ Stereo Aligner is a Qt 6 Widgets application for synchronizing and aligning two 
 - Load independent left-eye and right-eye video files.
 - Step either video backward or forward by exactly one frame.
 - Optional linked stepping for moving both timelines together.
-- Independent horizontal (X) and vertical (Y) alignment for both eyes.
+- Centered stereo-window and vertical alignment: every change moves the two eyes by equal amounts in opposite directions.
 - Automatic portrait/landscape detection with compact side-by-side portrait previews.
 - Preview-first workspace with a StereoMask-style left icon rail and dockable, scrollable controls drawer.
-- Independent 25–400% center zoom for each camera to compensate for different lenses and fields of view; zoom is included in export.
+- Complementary center zoom: reducing one eye increases the other by the same percentage, keeping the adjustment centered.
+- Fine, Medium and Long adjustment modes set zoom steps to 0.1%, 1% or 10% and movement steps to 1, 10 or 100 pixels.
+- Sliders and precise spin boxes stay synchronized; previews can also be dragged to position the eyes and scrolled to adjust zoom.
+- Optional full 10×10 alignment grid over the previews, with highlighted center axes.
 - SIFT/RANSAC automatic alignment, inspired by the Autopano-Sift workflow historically used by StereoPhoto Maker. It analyzes three nearby frame pairs and offers zoom-only or zoom-plus-X/Y correction with a confidence report.
 - Shared left, right, top and bottom cropping for both eyes, with automatic removal of black borders after auto alignment.
 - Automatic RGB color-balance and contrast matching using either the left or right selected frame as the reference; the correction is included in previews and export.
-- Save and reopen portable JSON projects containing both video paths, selected frames, transforms, crop, color correction and interface/output choices.
+- Build a project from multiple frame ranges, each with its own centered stereo-window, vertical and zoom adjustment.
+- Shared synchronized timeline beneath the previews, with a gold pending-start marker and a different colored band for every project range.
+- Editable range table with automatic `Range 1`, `Range 2`, … names and paired From/To frame columns.
+- Save and reopen portable JSON projects containing both video paths, frame ranges, transforms, crop, color correction and interface/output choices.
 - Side-by-side, red/cyan anaglyph, and difference previews.
 - Light and dark themes, with light selected by default.
 - English/US number formatting independent of Windows regional settings.
-- Full side-by-side, half side-by-side, and red/cyan anaglyph MP4 export.
-- Export begins at the frame pair currently selected in the UI.
+- Parallel full side-by-side, cross-view full side-by-side, half side-by-side (HSBS), and red/cyan anaglyph MP4 export.
+- Optional output eye-swap button for reversing the selected format without changing source assignments.
+- Export includes only project frame ranges, concatenated in list order, with one largest common black-border-free crop across the whole movie.
 - Choose audio from the left video, right video, or no audio.
 - Keyboard shortcuts for quick synchronization and alignment.
 
@@ -44,12 +51,12 @@ To make a portable folder, run `windeployqt` on the resulting executable and inc
 
 1. Load the left and right videos.
 2. Find the same visual event with the independent frame controls. `A/D` step the left video and `J/L` step the right video.
-3. Click **Auto align selected frames** to measure the relative camera zoom. Review the confidence report, then apply zoom only or zoom with X/Y positioning. The largest safe common crop is applied automatically.
+3. Click **Auto align selected frames** to measure relative zoom and positioning. Automatic results are divided equally and oppositely between both eyes.
 4. Fine-tune the left, right, top and bottom crop values, or use **Auto crop black borders** again after manual transform changes.
 5. Choose the left or right eye as the color reference and click **Auto match selected frames**. The reference eye is preserved while the other eye is corrected.
-6. Fine-tune horizontal, vertical and zoom values manually if needed. Hold `Shift` while using alignment shortcuts for 10-pixel steps.
-7. Select an output format and audio source.
-8. Click **Export from selected frames**. The current left and right frames become time zero in the output.
+6. Choose **Fine**, **Medium**, or **Long**, then fine-tune the **Stereo window**, **Vertical**, and **Zoom balance** sliders or spin boxes. Dragging a preview uses the selected movement resolution. Over a preview, each wheel event changes zoom by one selected step; **Ctrl+wheel** changes horizontal position by one selected step and **Shift+wheel** changes vertical position by one selected step. Enable **Grid** for full-image alignment guides. A 90% left zoom, for example, always produces a 110% right zoom.
+7. Use the shared timeline beneath the previews to scrub both synchronized eyes. Click **Mark start** to place the gold marker, move to the desired end, set the adjustment, and click **Add range end**. The new range appears as a colored timeline band and as a named row in the range table; double-click its name to rename it.
+8. Select an output format and audio source, then click **Export project ranges**. Only listed ranges are exported; the app concatenates them and applies one common borderless crop.
 
 Use **Save JSON** (`Ctrl+S`) to preserve the complete working state. **Open JSON** (`Ctrl+O`) restores it later. Video paths are stored both relative to the project file and as an absolute fallback, so a project can be moved together with its source videos.
 

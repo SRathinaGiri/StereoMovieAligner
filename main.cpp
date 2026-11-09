@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <memory>
 
 struct VideoInfo
 {
@@ -61,6 +62,74 @@ struct ColorCorrection
     }
 };
 
+struct CenteredAdjustment
+{
+    int stereoWindow = 0;
+    int vertical = 0;
+    double zoomBalance = 0.0;
+};
+
+struct FrameSegment
+{
+    QString name;
+    int leftStart = 0;
+    int rightStart = 0;
+    int leftEnd = 0;
+    int rightEnd = 0;
+    CenteredAdjustment adjustment;
+};
+
+class RangeTimelineSlider final : public QSlider
+{
+public:
+    struct Span { int first = 0; int last = 0; QColor color; };
+
+    explicit RangeTimelineSlider(QWidget *parent = nullptr) : QSlider(Qt::Horizontal, parent)
+    {
+        setMinimumHeight(30);
+        setToolTip("Shared synchronized timeline. Colored bands are project ranges.");
+    }
+
+    void setSpans(const QVector<Span> &value) { spans = value; update(); }
+    void setPendingStart(int value) { pendingStart = value; update(); }
+
+protected:
+    void paintEvent(QPaintEvent *event) override
+    {
+        QSlider::paintEvent(event);
+        QStyleOptionSlider option;
+        initStyleOption(&option);
+        QRect groove = style()->subControlRect(QStyle::CC_Slider, &option,
+                                               QStyle::SC_SliderGroove, this);
+        if (maximum() <= minimum() || groove.width() <= 0) return;
+        auto xForValue = [&](int value) {
+            const double ratio = (qBound(minimum(), value, maximum()) - minimum()) /
+                                 static_cast<double>(maximum() - minimum());
+            return groove.left() + qRound(ratio * groove.width());
+        };
+        QPainter painter(this);
+        painter.setPen(Qt::NoPen);
+        for (const Span &span : spans) {
+            const int x1 = xForValue(span.first);
+            const int x2 = xForValue(span.last);
+            QColor fill = span.color;
+            fill.setAlpha(210);
+            painter.setBrush(fill);
+            painter.drawRoundedRect(QRect(qMin(x1, x2), height() - 7,
+                                          qMax(3, qAbs(x2 - x1)), 6), 2, 2);
+        }
+        if (pendingStart >= minimum()) {
+            const int x = xForValue(pendingStart);
+            painter.setPen(QPen(QColor(255, 190, 30), 2));
+            painter.drawLine(x, 2, x, height() - 2);
+        }
+    }
+
+private:
+    QVector<Span> spans;
+    int pendingStart = -1;
+};
+
 class StereoAlignerWindow final : public QMainWindow
 {
 public:
@@ -99,6 +168,71 @@ public:
     }
 
 protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        const bool preview = watched == leftPreview || watched == rightPreview || watched == singlePreview;
+        if (!preview) return QMainWindow::eventFilter(watched, event);
+        if (event->type() == QEvent::MouseButtonPress) {
+            auto *mouse = static_cast<QMouseEvent*>(event);
+            if (mouse->button() != Qt::LeftButton || !leftInfo.valid() || !rightInfo.valid())
+                return QMainWindow::eventFilter(watched, event);
+            previewDragActive = true;
+            previewDragTarget = watched;
+            previewDragStart = mouse->position();
+            previewDragAdjustment = currentAdjustment();
+            static_cast<QWidget*>(watched)->setCursor(Qt::ClosedHandCursor);
+            mouse->accept();
+            return true;
+        }
+        if (event->type() == QEvent::MouseMove && previewDragActive && watched == previewDragTarget) {
+            auto *mouse = static_cast<QMouseEvent*>(event);
+            const QPointF delta = mouse->position() - previewDragStart;
+            CenteredAdjustment adjustment = previewDragAdjustment;
+            const int eyeDirection = watched == leftPreview ? -1 : 1;
+            const int step = pixelAdjustmentStep();
+            const double rawX = previewDragAdjustment.stereoWindow + eyeDirection * delta.x() * previewPixelsPerDisplayX;
+            const double rawY = previewDragAdjustment.vertical + eyeDirection * delta.y() * previewPixelsPerDisplayY;
+            adjustment.stereoWindow = qBound(-2000, qRound(rawX / step) * step, 2000);
+            adjustment.vertical = qBound(-2000, qRound(rawY / step) * step, 2000);
+            setCurrentAdjustment(adjustment);
+            mouse->accept();
+            return true;
+        }
+        if (event->type() == QEvent::Wheel && leftInfo.valid() && rightInfo.valid()) {
+            auto *wheel = static_cast<QWheelEvent*>(event);
+            const int wheelDelta = wheel->angleDelta().y();
+            if (wheelDelta == 0) return true;
+            const int direction = wheelDelta > 0 ? 1 : -1;
+            const int eyeDirection = watched == leftPreview ? -1 : 1;
+            CenteredAdjustment adjustment = currentAdjustment();
+            if (wheel->modifiers().testFlag(Qt::ControlModifier)) {
+                adjustment.stereoWindow = qBound(-2000,
+                    adjustment.stereoWindow + eyeDirection * direction * pixelAdjustmentStep(), 2000);
+                status->setText("Preview horizontal step applied");
+            } else if (wheel->modifiers().testFlag(Qt::ShiftModifier)) {
+                adjustment.vertical = qBound(-2000,
+                    adjustment.vertical - eyeDirection * direction * pixelAdjustmentStep(), 2000);
+                status->setText("Preview vertical step applied");
+            } else {
+                adjustment.zoomBalance = qBound(-75.0,
+                    adjustment.zoomBalance + eyeDirection * direction * zoomAdjustmentStep(), 75.0);
+                status->setText("Preview wheel zoom applied");
+            }
+            setCurrentAdjustment(adjustment);
+            wheel->accept();
+            return true;
+        }
+        if (event->type() == QEvent::MouseButtonRelease && previewDragActive && watched == previewDragTarget) {
+            previewDragActive = false;
+            previewDragTarget = nullptr;
+            static_cast<QWidget*>(watched)->setCursor(Qt::OpenHandCursor);
+            status->setText("Interactive adjustment applied");
+            event->accept();
+            return true;
+        }
+        return QMainWindow::eventFilter(watched, event);
+    }
+
     void closeEvent(QCloseEvent *event) override
     {
         QSettings settings;
@@ -145,11 +279,32 @@ private:
     QComboBox *themeSelector = nullptr;
     QComboBox *outputMode = nullptr;
     QComboBox *audioSource = nullptr;
+    QPushButton *swapOutputEyes = nullptr;
     QCheckBox *linkStepping = nullptr;
     QPushButton *openProjectButton = nullptr;
     QPushButton *saveProjectButton = nullptr;
     QPushButton *resetAlignment = nullptr;
     QPushButton *autoAlignButton = nullptr;
+    QSlider *stereoWindowSlider = nullptr;
+    QSlider *verticalSlider = nullptr;
+    QSlider *zoomBalanceSlider = nullptr;
+    QSpinBox *stereoWindowSpin = nullptr;
+    QSpinBox *verticalSpin = nullptr;
+    QDoubleSpinBox *zoomBalanceSpin = nullptr;
+    QLabel *stereoWindowValue = nullptr;
+    QLabel *verticalValue = nullptr;
+    QLabel *zoomBalanceValue = nullptr;
+    QTableWidget *segmentTable = nullptr;
+    RangeTimelineSlider *commonTimeline = nullptr;
+    QPushButton *timelineMarkStartButton = nullptr;
+    QPushButton *timelineAddEndButton = nullptr;
+    QLabel *commonTimelinePosition = nullptr;
+    QPushButton *markSegmentStartButton = nullptr;
+    QPushButton *addSegmentButton = nullptr;
+    QPushButton *updateSegmentButton = nullptr;
+    QPushButton *removeSegmentButton = nullptr;
+    QButtonGroup *adjustmentStepGroup = nullptr;
+    QCheckBox *showGrid = nullptr;
     QSpinBox *cropLeft = nullptr;
     QSpinBox *cropRight = nullptr;
     QSpinBox *cropTop = nullptr;
@@ -170,6 +325,17 @@ private:
     QString exportOutput;
     double exportDuration = 0.0;
     bool cancelRequested = false;
+    std::vector<FrameSegment> segments;
+    int markedLeftStart = -1;
+    int markedRightStart = -1;
+    bool previewDragActive = false;
+    QObject *previewDragTarget = nullptr;
+    QPointF previewDragStart;
+    CenteredAdjustment previewDragAdjustment;
+    double previewPixelsPerDisplayX = 1.0;
+    double previewPixelsPerDisplayY = 1.0;
+    bool updatingCommonTimeline = false;
+    double commonSyncOffsetSeconds = 0.0;
 
     static QString secondsText(double seconds)
     {
@@ -257,6 +423,25 @@ private:
         auto *workspaceTitle = new QLabel("Stereo workspace");
         workspaceTitle->setObjectName("workspaceTitle");
         header->addWidget(workspaceTitle);
+        header->addSpacing(12);
+        header->addWidget(new QLabel("Adjustment:"));
+        adjustmentStepGroup = new QButtonGroup(this);
+        auto *fineStep = new QRadioButton("Fine");
+        auto *mediumStep = new QRadioButton("Medium");
+        auto *longStep = new QRadioButton("Long");
+        adjustmentStepGroup->addButton(fineStep, 0);
+        adjustmentStepGroup->addButton(mediumStep, 1);
+        adjustmentStepGroup->addButton(longStep, 2);
+        fineStep->setChecked(true);
+        fineStep->setToolTip("Zoom 0.1%; movement 1 pixel.");
+        mediumStep->setToolTip("Zoom 1%; movement 10 pixels.");
+        longStep->setToolTip("Zoom 10%; movement 100 pixels.");
+        header->addWidget(fineStep);
+        header->addWidget(mediumStep);
+        header->addWidget(longStep);
+        showGrid = new QCheckBox("Grid");
+        showGrid->setToolTip("Show or hide alignment guides over the previews.");
+        header->addWidget(showGrid);
         header->addStretch();
         previewMode = new QComboBox;
         previewMode->addItems({"Side by side", "Red / cyan anaglyph", "Difference"});
@@ -278,12 +463,30 @@ private:
         sbs->setAlignment(Qt::AlignCenter);
         leftPreview = makePreviewLabel("LEFT");
         rightPreview = makePreviewLabel("RIGHT");
+        leftPreview->installEventFilter(this);
+        rightPreview->installEventFilter(this);
         sbs->addWidget(leftPreview);
         sbs->addWidget(rightPreview);
         singlePreview = makePreviewLabel("PREVIEW");
+        singlePreview->installEventFilter(this);
         previewStack->addWidget(sbsPage);
         previewStack->addWidget(singlePreview);
         main->addWidget(previewStack, 1);
+
+        auto *timelineRow = new QHBoxLayout;
+        timelineMarkStartButton = new QPushButton("Mark start");
+        timelineAddEndButton = new QPushButton("Add range end");
+        commonTimeline = new RangeTimelineSlider;
+        commonTimeline->setRange(0, 0);
+        commonTimelinePosition = new QLabel("00:00:00.000");
+        commonTimelinePosition->setMinimumWidth(92);
+        timelineMarkStartButton->setToolTip("Mark the current synchronized frame pair as the range start.");
+        timelineAddEndButton->setToolTip("Add a range from the marked start to the current synchronized frame pair.");
+        timelineRow->addWidget(timelineMarkStartButton);
+        timelineRow->addWidget(commonTimeline, 1);
+        timelineRow->addWidget(commonTimelinePosition);
+        timelineRow->addWidget(timelineAddEndButton);
+        main->addLayout(timelineRow);
 
         syncSummary = new QLabel("Load both videos to begin.");
         syncSummary->setObjectName("summary");
@@ -325,35 +528,94 @@ private:
         drawerLayout->addWidget(makeTimelineCard(true));
         drawerLayout->addWidget(makeTimelineCard(false));
 
-        auto *alignGroup = new QGroupBox("Transform");
+        auto *alignGroup = new QGroupBox("Centered stereo adjustment");
         auto *align = new QGridLayout(alignGroup);
         align->setColumnStretch(1, 1);
-        align->setColumnStretch(2, 1);
-        align->addWidget(new QLabel("Eye"), 0, 0);
-        align->addWidget(new QLabel("Left / right"), 0, 1);
-        align->addWidget(new QLabel("Up / down"), 0, 2);
         setupOffsetSpin(leftUi.x);
         setupOffsetSpin(leftUi.y);
         setupOffsetSpin(rightUi.x);
         setupOffsetSpin(rightUi.y);
         setupZoomSpin(leftUi.zoom);
         setupZoomSpin(rightUi.zoom);
-        align->addWidget(new QLabel("Left"), 1, 0);
-        align->addWidget(leftUi.x, 1, 1);
-        align->addWidget(leftUi.y, 1, 2);
-        align->addWidget(new QLabel("Zoom"), 2, 0);
-        align->addWidget(leftUi.zoom, 2, 1, 1, 2);
-        align->addWidget(new QLabel("Right"), 3, 0);
-        align->addWidget(rightUi.x, 3, 1);
-        align->addWidget(rightUi.y, 3, 2);
-        align->addWidget(new QLabel("Zoom"), 4, 0);
-        align->addWidget(rightUi.zoom, 4, 1, 1, 2);
+        const QList<QWidget*> hiddenEyeControls {leftUi.x, leftUi.y, rightUi.x, rightUi.y,
+                                                 leftUi.zoom, rightUi.zoom};
+        for (QWidget *hidden : hiddenEyeControls) hidden->hide();
+        auto makeFineSlider = [](int minimum, int maximum, int step) {
+            auto *slider = new QSlider(Qt::Horizontal);
+            slider->setRange(minimum, maximum);
+            slider->setSingleStep(step);
+            slider->setPageStep(step * 10);
+            slider->setTracking(true);
+            return slider;
+        };
+        stereoWindowSlider = makeFineSlider(-2000, 2000, 1);
+        verticalSlider = makeFineSlider(-2000, 2000, 1);
+        zoomBalanceSlider = makeFineSlider(-750, 750, 1); // tenths of one percent
+        stereoWindowSpin = new QSpinBox;
+        stereoWindowSpin->setRange(-2000, 2000);
+        stereoWindowSpin->setSuffix(" px");
+        stereoWindowSpin->setKeyboardTracking(false);
+        verticalSpin = new QSpinBox;
+        verticalSpin->setRange(-2000, 2000);
+        verticalSpin->setSuffix(" px");
+        verticalSpin->setKeyboardTracking(false);
+        zoomBalanceSpin = new QDoubleSpinBox;
+        zoomBalanceSpin->setRange(-75.0, 75.0);
+        zoomBalanceSpin->setDecimals(1);
+        zoomBalanceSpin->setSuffix(" %");
+        zoomBalanceSpin->setKeyboardTracking(false);
+        stereoWindowValue = new QLabel("0 px");
+        verticalValue = new QLabel("0 px");
+        zoomBalanceValue = new QLabel("L 100.0% / R 100.0%");
+        stereoWindowSlider->setToolTip("Move the left and right images horizontally by equal amounts in opposite directions.");
+        verticalSlider->setToolTip("Move the left and right images vertically by equal amounts in opposite directions.");
+        zoomBalanceSlider->setToolTip("Change both zooms equally around 100%. One eye shrinks by the amount the other grows.");
+        align->addWidget(new QLabel("Stereo window"), 0, 0);
+        align->addWidget(stereoWindowSlider, 0, 1);
+        align->addWidget(stereoWindowSpin, 0, 2);
+        align->addWidget(stereoWindowValue, 0, 3);
+        align->addWidget(new QLabel("Vertical"), 1, 0);
+        align->addWidget(verticalSlider, 1, 1);
+        align->addWidget(verticalSpin, 1, 2);
+        align->addWidget(verticalValue, 1, 3);
+        align->addWidget(new QLabel("Zoom balance"), 2, 0);
+        align->addWidget(zoomBalanceSlider, 2, 1);
+        align->addWidget(zoomBalanceSpin, 2, 2);
+        align->addWidget(zoomBalanceValue, 2, 3);
         autoAlignButton = new QPushButton("Auto align selected frames");
-        autoAlignButton->setToolTip("Estimate relative zoom and X/Y alignment from matched features in nearby frame pairs.");
-        align->addWidget(autoAlignButton, 5, 0, 1, 3);
-        resetAlignment = new QPushButton("Reset transforms");
-        align->addWidget(resetAlignment, 6, 0, 1, 3);
+        autoAlignButton->setToolTip("Estimate zoom and X/Y alignment, then split every correction equally around the stereo center.");
+        align->addWidget(autoAlignButton, 3, 0, 1, 4);
+        resetAlignment = new QPushButton("Center all adjustments");
+        align->addWidget(resetAlignment, 4, 0, 1, 4);
         drawerLayout->addWidget(alignGroup);
+
+        auto *segmentsGroup = new QGroupBox("Project frame ranges");
+        auto *segmentsLayout = new QGridLayout(segmentsGroup);
+        segmentTable = new QTableWidget(0, 4);
+        segmentTable->setHorizontalHeaderLabels({"Name", "From", "To", "Adjustment"});
+        segmentTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        segmentTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        segmentTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+        segmentTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+        segmentTable->verticalHeader()->setVisible(false);
+        segmentTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+        segmentTable->setSelectionMode(QAbstractItemView::SingleSelection);
+        segmentTable->setMinimumHeight(130);
+        segmentTable->setToolTip("Only ranges in this table are exported, in this order. Double-click a name to edit it.");
+        markSegmentStartButton = new QPushButton("Mark range start");
+        addSegmentButton = new QPushButton("Add range to current frames");
+        updateSegmentButton = new QPushButton("Update selected adjustment");
+        removeSegmentButton = new QPushButton("Remove selected range");
+        segmentsLayout->addWidget(segmentTable, 0, 0, 1, 2);
+        segmentsLayout->addWidget(markSegmentStartButton, 1, 0);
+        segmentsLayout->addWidget(addSegmentButton, 1, 1);
+        segmentsLayout->addWidget(updateSegmentButton, 2, 0);
+        segmentsLayout->addWidget(removeSegmentButton, 2, 1);
+        auto *rangeHint = new QLabel("Mark a synchronized start, move to the end, set the three adjustments, then add the range.");
+        rangeHint->setObjectName("details");
+        rangeHint->setWordWrap(true);
+        segmentsLayout->addWidget(rangeHint, 3, 0, 1, 2);
+        drawerLayout->addWidget(segmentsGroup);
 
         auto *cropGroup = new QGroupBox("Crop aligned pair");
         auto *cropGrid = new QGridLayout(cropGroup);
@@ -397,22 +659,27 @@ private:
         auto *exportGroup = new QGroupBox("Output");
         auto *exportGrid = new QGridLayout(exportGroup);
         outputMode = new QComboBox;
-        outputMode->addItems({"Full side by side", "Half side by side", "Red / cyan anaglyph"});
+        outputMode->addItems({"Parallel full SBS", "Cross-view full SBS",
+                              "Red / cyan anaglyph", "Half SBS (HSBS)"});
         audioSource = new QComboBox;
         audioSource->addItems({"Left video", "Right video", "No audio"});
+        swapOutputEyes = new QPushButton("Swap output eyes: Off");
+        swapOutputEyes->setCheckable(true);
+        swapOutputEyes->setToolTip("Reverse left and right at export. Cross-view already reverses the normal parallel order.");
         exportGrid->addWidget(new QLabel("Format"), 0, 0);
         exportGrid->addWidget(outputMode, 0, 1);
         exportGrid->addWidget(new QLabel("Audio"), 1, 0);
         exportGrid->addWidget(audioSource, 1, 1);
-        exportButton = new QPushButton("Export from selected frames");
+        exportGrid->addWidget(swapOutputEyes, 2, 0, 1, 2);
+        exportButton = new QPushButton("Export project ranges");
         exportButton->setObjectName("primaryButton");
         cancelButton = new QPushButton("Cancel");
         cancelButton->setVisible(false);
-        exportGrid->addWidget(exportButton, 2, 0, 1, 2);
-        exportGrid->addWidget(cancelButton, 3, 0, 1, 2);
+        exportGrid->addWidget(exportButton, 3, 0, 1, 2);
+        exportGrid->addWidget(cancelButton, 4, 0, 1, 2);
         drawerLayout->addWidget(exportGroup);
 
-        auto *shortcutHint = new QLabel("A/D: left frame   J/L: right frame\nCtrl+arrows: left XY   Alt+arrows: right XY");
+        auto *shortcutHint = new QLabel("Drag: horizontal/vertical  •  Wheel: zoom\nCtrl+wheel: horizontal  •  Shift+wheel: vertical");
         shortcutHint->setObjectName("details");
         shortcutHint->setWordWrap(true);
         drawerLayout->addWidget(shortcutHint);
@@ -428,8 +695,8 @@ private:
         controlsDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
         controlsDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable | QDockWidget::DockWidgetClosable);
         controlsDock->setWidget(scroll);
-        controlsDock->setMinimumWidth(310);
-        controlsDock->resize(340, height());
+        controlsDock->setMinimumWidth(410);
+        controlsDock->resize(430, height());
         addDockWidget(Qt::LeftDockWidgetArea, controlsDock);
 
         auto *rail = new QToolBar("Toolbox rail", this);
@@ -510,6 +777,8 @@ private:
         label->setAlignment(Qt::AlignCenter);
         label->setMinimumHeight(250);
         label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+        label->setCursor(Qt::OpenHandCursor);
+        label->setToolTip("Drag to position. Wheel: zoom. Ctrl+wheel: horizontal. Shift+wheel: vertical. All use the selected adjustment step.");
         label->setStyleSheet("background:#05070a; border:1px solid #2a3543; border-radius:6px; color:#65758a; font-size:16px;");
         return label;
     }
@@ -544,6 +813,183 @@ private:
                          .arg(side.toLower(), side.toLower()));
     }
 
+    int pixelAdjustmentStep() const
+    {
+        const int level = adjustmentStepGroup ? adjustmentStepGroup->checkedId() : 0;
+        return level == 2 ? 100 : (level == 1 ? 10 : 1);
+    }
+
+    double zoomAdjustmentStep() const
+    {
+        const int level = adjustmentStepGroup ? adjustmentStepGroup->checkedId() : 0;
+        return level == 2 ? 10.0 : (level == 1 ? 1.0 : 0.1);
+    }
+
+    void updateAdjustmentSteps()
+    {
+        const int pixelStep = pixelAdjustmentStep();
+        const int zoomStep = qRound(zoomAdjustmentStep() * 10.0);
+        stereoWindowSlider->setSingleStep(pixelStep);
+        stereoWindowSlider->setPageStep(pixelStep);
+        verticalSlider->setSingleStep(pixelStep);
+        verticalSlider->setPageStep(pixelStep);
+        zoomBalanceSlider->setSingleStep(zoomStep);
+        zoomBalanceSlider->setPageStep(zoomStep);
+        stereoWindowSpin->setSingleStep(pixelStep);
+        verticalSpin->setSingleStep(pixelStep);
+        zoomBalanceSpin->setSingleStep(zoomAdjustmentStep());
+        status->setText(QString("Adjustment step: zoom %1%, movement %2 px")
+                        .arg(zoomAdjustmentStep(), 0, 'f', 1).arg(pixelStep));
+    }
+
+    CenteredAdjustment currentAdjustment() const
+    {
+        return {stereoWindowSlider->value(), verticalSlider->value(),
+                zoomBalanceSlider->value() / 10.0};
+    }
+
+    void applyCenteredAdjustment(const CenteredAdjustment &adjustment)
+    {
+        const double balance = qBound(-75.0, adjustment.zoomBalance, 75.0);
+        const QList<QObject*> controls {leftUi.x, leftUi.y, rightUi.x, rightUi.y,
+                                        leftUi.zoom, rightUi.zoom};
+        std::vector<std::unique_ptr<QSignalBlocker>> blockers;
+        for (QObject *control : controls) blockers.emplace_back(std::make_unique<QSignalBlocker>(control));
+        leftUi.x->setValue(-adjustment.stereoWindow);
+        rightUi.x->setValue(adjustment.stereoWindow);
+        leftUi.y->setValue(-adjustment.vertical);
+        rightUi.y->setValue(adjustment.vertical);
+        leftUi.zoom->setValue(100.0 - balance);
+        rightUi.zoom->setValue(100.0 + balance);
+        const QSignalBlocker sw(stereoWindowSpin), sv(verticalSpin), sz(zoomBalanceSpin);
+        stereoWindowSpin->setValue(adjustment.stereoWindow);
+        verticalSpin->setValue(adjustment.vertical);
+        zoomBalanceSpin->setValue(balance);
+        stereoWindowValue->setText(QString("L %1 / R %2 px").arg(-adjustment.stereoWindow).arg(adjustment.stereoWindow));
+        verticalValue->setText(QString("L %1 / R %2 px").arg(-adjustment.vertical).arg(adjustment.vertical));
+        zoomBalanceValue->setText(QString("L %1% / R %2%")
+                                  .arg(100.0 - balance, 0, 'f', 1).arg(100.0 + balance, 0, 'f', 1));
+        updateSummary();
+        requestPreview();
+    }
+
+    void setCurrentAdjustment(const CenteredAdjustment &adjustment)
+    {
+        const QSignalBlocker a(stereoWindowSlider), b(verticalSlider), c(zoomBalanceSlider);
+        const QSignalBlocker d(stereoWindowSpin), e(verticalSpin), f(zoomBalanceSpin);
+        stereoWindowSlider->setValue(qBound(-2000, adjustment.stereoWindow, 2000));
+        verticalSlider->setValue(qBound(-2000, adjustment.vertical, 2000));
+        zoomBalanceSlider->setValue(qBound(-750, qRound(adjustment.zoomBalance * 10.0), 750));
+        stereoWindowSpin->setValue(stereoWindowSlider->value());
+        verticalSpin->setValue(verticalSlider->value());
+        zoomBalanceSpin->setValue(zoomBalanceSlider->value() / 10.0);
+        applyCenteredAdjustment(currentAdjustment());
+    }
+
+    QString segmentAdjustmentText(const FrameSegment &segment) const
+    {
+        return QString("W %1  V %2  Z %3%")
+            .arg(segment.adjustment.stereoWindow).arg(segment.adjustment.vertical)
+            .arg(segment.adjustment.zoomBalance, 0, 'f', 1);
+    }
+
+    QColor segmentColor(int index) const
+    {
+        return QColor::fromHsv((index * 67 + 15) % 360, 190, 225);
+    }
+
+    void refreshSegmentList(int selected = -1)
+    {
+        const QSignalBlocker blocker(segmentTable);
+        segmentTable->setRowCount(static_cast<int>(segments.size()));
+        QVector<RangeTimelineSlider::Span> spans;
+        for (int i = 0; i < static_cast<int>(segments.size()); ++i) {
+            FrameSegment &segment = segments[i];
+            if (segment.name.trimmed().isEmpty()) segment.name = QString("Range %1").arg(i + 1);
+            const QColor color = segmentColor(i);
+            auto *name = new QTableWidgetItem(segment.name);
+            name->setBackground(QBrush(QColor(color.red(), color.green(), color.blue(), 90)));
+            auto makeReadOnly = [](const QString &text) {
+                auto *item = new QTableWidgetItem(text);
+                item->setFlags(item->flags() & ~Qt::ItemIsEditable);
+                return item;
+            };
+            segmentTable->setItem(i, 0, name);
+            segmentTable->setItem(i, 1, makeReadOnly(QString("L %1 / R %2").arg(segment.leftStart).arg(segment.rightStart)));
+            segmentTable->setItem(i, 2, makeReadOnly(QString("L %1 / R %2").arg(segment.leftEnd).arg(segment.rightEnd)));
+            segmentTable->setItem(i, 3, makeReadOnly(segmentAdjustmentText(segment)));
+            const int firstMs = leftInfo.valid() ? qRound(segment.leftStart * 1000.0 / leftInfo.fps) : 0;
+            const int lastMs = leftInfo.valid() ? qRound(segment.leftEnd * 1000.0 / leftInfo.fps) : 0;
+            spans.push_back({firstMs, lastMs, color});
+        }
+        commonTimeline->setSpans(spans);
+        if (selected >= 0 && selected < segmentTable->rowCount()) segmentTable->setCurrentCell(selected, 0);
+        updateReadyState();
+    }
+
+    int selectedSegmentRow() const
+    {
+        return segmentTable->selectionModel()->selectedRows().isEmpty()
+            ? -1 : segmentTable->selectionModel()->selectedRows().first().row();
+    }
+
+    void updateCommonTimelineFromFrames()
+    {
+        if (updatingCommonTimeline || !leftInfo.valid() || !rightInfo.valid()) return;
+        const double leftSeconds = leftUi.frame->value() / leftInfo.fps;
+        const double rightSeconds = rightUi.frame->value() / rightInfo.fps;
+        commonSyncOffsetSeconds = rightSeconds - leftSeconds;
+        const int minimumMs = qMax(0, qCeil(-commonSyncOffsetSeconds * 1000.0));
+        const int maximumMs = qMax(minimumMs, qFloor(qMin(leftInfo.duration,
+            rightInfo.duration - commonSyncOffsetSeconds) * 1000.0));
+        const QSignalBlocker blocker(commonTimeline);
+        commonTimeline->setRange(minimumMs, maximumMs);
+        commonTimeline->setValue(qBound(minimumMs, qRound(leftSeconds * 1000.0), maximumMs));
+        commonTimelinePosition->setText(secondsText(leftSeconds));
+        refreshTimelineMarkers();
+    }
+
+    void refreshTimelineMarkers()
+    {
+        commonTimeline->setPendingStart(markedLeftStart >= 0 && leftInfo.valid()
+            ? qRound(markedLeftStart * 1000.0 / leftInfo.fps) : -1);
+    }
+
+    void markSegmentStart()
+    {
+        if (!leftInfo.valid() || !rightInfo.valid()) return;
+        markedLeftStart = leftUi.frame->value();
+        markedRightStart = rightUi.frame->value();
+        refreshTimelineMarkers();
+        status->setText(QString("Range start marked: L %1 / R %2").arg(markedLeftStart).arg(markedRightStart));
+    }
+
+    void addSegment()
+    {
+        if (markedLeftStart < 0 || markedRightStart < 0) {
+            QMessageBox::information(this, "Mark a range start", "Mark the start frames before adding a project range.");
+            return;
+        }
+        const int leftEnd = leftUi.frame->value();
+        const int rightEnd = rightUi.frame->value();
+        if (leftEnd <= markedLeftStart || rightEnd <= markedRightStart) {
+            QMessageBox::warning(this, "Invalid frame range", "Both current frames must be later than their marked start frames.");
+            return;
+        }
+        FrameSegment segment;
+        segment.name = QString("Range %1").arg(segments.size() + 1);
+        segment.leftStart = markedLeftStart;
+        segment.rightStart = markedRightStart;
+        segment.leftEnd = leftEnd;
+        segment.rightEnd = rightEnd;
+        segment.adjustment = currentAdjustment();
+        segments.push_back(segment);
+        markedLeftStart = markedRightStart = -1;
+        refreshTimelineMarkers();
+        refreshSegmentList(static_cast<int>(segments.size()) - 1);
+        status->setText("Project range added");
+    }
+
     void connectUi()
     {
         connect(openProjectButton, &QPushButton::clicked, this, [this] { openProject(); });
@@ -561,6 +1007,42 @@ private:
             connect(spin, &QSpinBox::valueChanged, this, [this] { updateSummary(); requestPreview(); });
         for (QDoubleSpinBox *spin : {leftUi.zoom, rightUi.zoom})
             connect(spin, &QDoubleSpinBox::valueChanged, this, [this] { updateSummary(); requestPreview(); });
+        connect(stereoWindowSlider, &QSlider::valueChanged, this, [this](int value) {
+            const int step = pixelAdjustmentStep();
+            const int snapped = qBound(stereoWindowSlider->minimum(),
+                                       qRound(value / static_cast<double>(step)) * step,
+                                       stereoWindowSlider->maximum());
+            if (snapped != value) { stereoWindowSlider->setValue(snapped); return; }
+            applyCenteredAdjustment(currentAdjustment());
+        });
+        connect(verticalSlider, &QSlider::valueChanged, this, [this](int value) {
+            const int step = pixelAdjustmentStep();
+            const int snapped = qBound(verticalSlider->minimum(),
+                                       qRound(value / static_cast<double>(step)) * step,
+                                       verticalSlider->maximum());
+            if (snapped != value) { verticalSlider->setValue(snapped); return; }
+            applyCenteredAdjustment(currentAdjustment());
+        });
+        connect(zoomBalanceSlider, &QSlider::valueChanged, this, [this](int value) {
+            const int step = qRound(zoomAdjustmentStep() * 10.0);
+            const int snapped = qBound(zoomBalanceSlider->minimum(),
+                                       qRound(value / static_cast<double>(step)) * step,
+                                       zoomBalanceSlider->maximum());
+            if (snapped != value) { zoomBalanceSlider->setValue(snapped); return; }
+            applyCenteredAdjustment(currentAdjustment());
+        });
+        connect(stereoWindowSpin, &QSpinBox::valueChanged, this, [this](int value) { stereoWindowSlider->setValue(value); });
+        connect(verticalSpin, &QSpinBox::valueChanged, this, [this](int value) { verticalSlider->setValue(value); });
+        connect(zoomBalanceSpin, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+            zoomBalanceSlider->setValue(qRound(value * 10.0));
+        });
+        connect(adjustmentStepGroup, &QButtonGroup::idClicked, this, [this] { updateAdjustmentSteps(); });
+        connect(showGrid, &QCheckBox::toggled, this, [this] { requestPreview(); });
+        connect(swapOutputEyes, &QPushButton::toggled, this, [this](bool checked) {
+            swapOutputEyes->setText(checked ? "Swap output eyes: On" : "Swap output eyes: Off");
+            status->setText(checked ? "Output eye order reversed" : "Normal output eye order");
+        });
+        updateAdjustmentSteps();
         for (QSpinBox *spin : {cropLeft, cropRight, cropTop, cropBottom})
             connect(spin, &QSpinBox::valueChanged, this, [this] { updateSummary(); requestPreview(); });
 
@@ -573,9 +1055,51 @@ private:
             applyTheme(index == 1);
         });
         connect(resetAlignment, &QPushButton::clicked, this, [this] {
-            leftUi.x->setValue(0); leftUi.y->setValue(0);
-            rightUi.x->setValue(0); rightUi.y->setValue(0);
-            leftUi.zoom->setValue(100.0); rightUi.zoom->setValue(100.0);
+            setCurrentAdjustment({});
+        });
+        connect(markSegmentStartButton, &QPushButton::clicked, this, [this] { markSegmentStart(); });
+        connect(addSegmentButton, &QPushButton::clicked, this, [this] { addSegment(); });
+        connect(timelineMarkStartButton, &QPushButton::clicked, this, [this] { markSegmentStart(); });
+        connect(timelineAddEndButton, &QPushButton::clicked, this, [this] { addSegment(); });
+        connect(commonTimeline, &QSlider::valueChanged, this, [this](int milliseconds) {
+            if (updatingCommonTimeline || !leftInfo.valid() || !rightInfo.valid()) return;
+            updatingCommonTimeline = true;
+            const double leftSeconds = milliseconds / 1000.0;
+            const double rightSeconds = leftSeconds + commonSyncOffsetSeconds;
+            leftUi.frame->setValue(qBound(0, qRound(leftSeconds * leftInfo.fps), leftInfo.totalFrames - 1));
+            rightUi.frame->setValue(qBound(0, qRound(rightSeconds * rightInfo.fps), rightInfo.totalFrames - 1));
+            updatingCommonTimeline = false;
+            commonTimelinePosition->setText(secondsText(leftSeconds));
+            updateSummary();
+            requestPreview();
+        });
+        connect(updateSegmentButton, &QPushButton::clicked, this, [this] {
+            const int row = selectedSegmentRow();
+            if (row < 0 || row >= static_cast<int>(segments.size())) return;
+            segments[row].adjustment = currentAdjustment();
+            refreshSegmentList(row);
+            status->setText("Selected range adjustment updated");
+        });
+        connect(removeSegmentButton, &QPushButton::clicked, this, [this] {
+            const int row = selectedSegmentRow();
+            if (row < 0 || row >= static_cast<int>(segments.size())) return;
+            segments.erase(segments.begin() + row);
+            refreshSegmentList(qMin(row, static_cast<int>(segments.size()) - 1));
+            status->setText("Project range removed");
+        });
+        connect(segmentTable, &QTableWidget::itemDoubleClicked, this, [this](QTableWidgetItem *item) {
+            const int row = item->row();
+            if (row < 0 || row >= static_cast<int>(segments.size())) return;
+            const FrameSegment &segment = segments[row];
+            leftUi.frame->setValue(segment.leftStart);
+            rightUi.frame->setValue(segment.rightStart);
+            setCurrentAdjustment(segment.adjustment);
+        });
+        connect(segmentTable, &QTableWidget::itemSelectionChanged, this, [this] { updateReadyState(); });
+        connect(segmentTable, &QTableWidget::itemChanged, this, [this](QTableWidgetItem *item) {
+            if (!item || item->column() != 0 || item->row() < 0 || item->row() >= static_cast<int>(segments.size())) return;
+            const QString name = item->text().trimmed();
+            segments[item->row()].name = name.isEmpty() ? QString("Range %1").arg(item->row() + 1) : name;
         });
         connect(autoAlignButton, &QPushButton::clicked, this, [this] { autoAlign(); });
         connect(autoCropButton, &QPushButton::clicked, this, [this] { autoCropBorders(); });
@@ -614,8 +1138,9 @@ private:
             if (ui.frame->value() != value) ui.frame->setValue(value);
             updateSummary(); requestPreview();
         });
-        connect(ui.frame, &QSpinBox::valueChanged, this, [&ui](int value) {
+        connect(ui.frame, &QSpinBox::valueChanged, this, [this, &ui](int value) {
             if (ui.slider->value() != value) ui.slider->setValue(value);
+            updateCommonTimelineFromFrames();
         });
     }
 
@@ -627,23 +1152,15 @@ private:
 
     void addAlignmentShortcuts()
     {
-        auto nudge = [this](QSpinBox *spin, int amount) { spin->setValue(spin->value() + amount); };
-        addShortcut(QKeySequence("Ctrl+Left"), [=] { nudge(leftUi.x, -1); });
-        addShortcut(QKeySequence("Ctrl+Right"), [=] { nudge(leftUi.x, 1); });
-        addShortcut(QKeySequence("Ctrl+Up"), [=] { nudge(leftUi.y, -1); });
-        addShortcut(QKeySequence("Ctrl+Down"), [=] { nudge(leftUi.y, 1); });
-        addShortcut(QKeySequence("Alt+Left"), [=] { nudge(rightUi.x, -1); });
-        addShortcut(QKeySequence("Alt+Right"), [=] { nudge(rightUi.x, 1); });
-        addShortcut(QKeySequence("Alt+Up"), [=] { nudge(rightUi.y, -1); });
-        addShortcut(QKeySequence("Alt+Down"), [=] { nudge(rightUi.y, 1); });
-        addShortcut(QKeySequence("Ctrl+Shift+Left"), [=] { nudge(leftUi.x, -10); });
-        addShortcut(QKeySequence("Ctrl+Shift+Right"), [=] { nudge(leftUi.x, 10); });
-        addShortcut(QKeySequence("Ctrl+Shift+Up"), [=] { nudge(leftUi.y, -10); });
-        addShortcut(QKeySequence("Ctrl+Shift+Down"), [=] { nudge(leftUi.y, 10); });
-        addShortcut(QKeySequence("Alt+Shift+Left"), [=] { nudge(rightUi.x, -10); });
-        addShortcut(QKeySequence("Alt+Shift+Right"), [=] { nudge(rightUi.x, 10); });
-        addShortcut(QKeySequence("Alt+Shift+Up"), [=] { nudge(rightUi.y, -10); });
-        addShortcut(QKeySequence("Alt+Shift+Down"), [=] { nudge(rightUi.y, 10); });
+        auto nudge = [](QSlider *slider, int amount) { slider->setValue(slider->value() + amount); };
+        addShortcut(QKeySequence("Ctrl+Left"), [=] { nudge(stereoWindowSlider, -pixelAdjustmentStep()); });
+        addShortcut(QKeySequence("Ctrl+Right"), [=] { nudge(stereoWindowSlider, pixelAdjustmentStep()); });
+        addShortcut(QKeySequence("Ctrl+Up"), [=] { nudge(verticalSlider, -pixelAdjustmentStep()); });
+        addShortcut(QKeySequence("Ctrl+Down"), [=] { nudge(verticalSlider, pixelAdjustmentStep()); });
+        addShortcut(QKeySequence("Ctrl+Shift+Left"), [=] { nudge(stereoWindowSlider, -pixelAdjustmentStep() * 10); });
+        addShortcut(QKeySequence("Ctrl+Shift+Right"), [=] { nudge(stereoWindowSlider, pixelAdjustmentStep() * 10); });
+        addShortcut(QKeySequence("Ctrl+Shift+Up"), [=] { nudge(verticalSlider, -pixelAdjustmentStep() * 10); });
+        addShortcut(QKeySequence("Ctrl+Shift+Down"), [=] { nudge(verticalSlider, pixelAdjustmentStep() * 10); });
     }
 
     static QJsonObject colorToJson(const ColorCorrection &correction)
@@ -703,6 +1220,22 @@ private:
         };
     }
 
+    QJsonArray segmentsToJson() const
+    {
+        QJsonArray array;
+        for (const FrameSegment &segment : segments) {
+            array.append(QJsonObject {
+                {"name", segment.name},
+                {"leftStart", segment.leftStart}, {"rightStart", segment.rightStart},
+                {"leftEnd", segment.leftEnd}, {"rightEnd", segment.rightEnd},
+                {"stereoWindow", segment.adjustment.stereoWindow},
+                {"vertical", segment.adjustment.vertical},
+                {"zoomBalance", segment.adjustment.zoomBalance}
+            });
+        }
+        return array;
+    }
+
     void saveProject()
     {
         if (!leftInfo.valid() || !rightInfo.valid()) {
@@ -721,18 +1254,27 @@ private:
         const QDir projectDirectory = QFileInfo(path).absoluteDir();
         QJsonObject root {
             {"application", "Stereo Aligner"},
-            {"version", 1},
+            {"version", 2},
             {"leftEye", eyeToJson(leftInfo, leftUi, leftColor, projectDirectory)},
             {"rightEye", eyeToJson(rightInfo, rightUi, rightColor, projectDirectory)},
             {"crop", QJsonObject {{"left", cropLeft->value()}, {"right", cropRight->value()},
                                    {"top", cropTop->value()}, {"bottom", cropBottom->value()}}},
+            {"centeredAdjustment", QJsonObject {
+                {"stereoWindow", currentAdjustment().stereoWindow},
+                {"vertical", currentAdjustment().vertical},
+                {"zoomBalance", currentAdjustment().zoomBalance}
+            }},
+            {"segments", segmentsToJson()},
             {"interface", QJsonObject {
                 {"linkedStepping", linkStepping->isChecked()},
                 {"previewMode", previewMode->currentIndex()},
                 {"theme", themeSelector->currentIndex()},
                 {"outputMode", outputMode->currentIndex()},
                 {"audioSource", audioSource->currentIndex()},
-                {"colorReference", colorReference->currentIndex()}
+                {"swapOutputEyes", swapOutputEyes->isChecked()},
+                {"colorReference", colorReference->currentIndex()},
+                {"adjustmentStep", adjustmentStepGroup->checkedId()},
+                {"showGrid", showGrid->isChecked()}
             }}
         };
         QSaveFile file(path);
@@ -774,8 +1316,9 @@ private:
             return;
         }
         const QJsonObject root = document.object();
+        const int projectVersion = root.value("version").toInt();
         if (root.value("application").toString() != "Stereo Aligner" ||
-            root.value("version").toInt() != 1 ||
+            (projectVersion != 1 && projectVersion != 2) ||
             !root.value("leftEye").isObject() || !root.value("rightEye").isObject()) {
             QMessageBox::critical(this, "Invalid project",
                                   "This is not a supported Stereo Aligner project file.");
@@ -808,6 +1351,31 @@ private:
         }
         restoreEye(leftEye, leftUi, leftColor);
         restoreEye(rightEye, rightUi, rightColor);
+        if (projectVersion >= 2) {
+            const QJsonObject adjustment = root.value("centeredAdjustment").toObject();
+            setCurrentAdjustment({adjustment.value("stereoWindow").toInt(),
+                                  adjustment.value("vertical").toInt(),
+                                  adjustment.value("zoomBalance").toDouble()});
+        } else {
+            setCurrentAdjustment({qRound((rightUi.x->value() - leftUi.x->value()) / 2.0),
+                                  qRound((rightUi.y->value() - leftUi.y->value()) / 2.0),
+                                  (rightUi.zoom->value() - leftUi.zoom->value()) / 2.0});
+        }
+        segments.clear();
+        for (const QJsonValue &value : root.value("segments").toArray()) {
+            const QJsonObject object = value.toObject();
+            FrameSegment segment;
+            segment.name = object.value("name").toString(QString("Range %1").arg(segments.size() + 1));
+            segment.leftStart = object.value("leftStart").toInt();
+            segment.rightStart = object.value("rightStart").toInt();
+            segment.leftEnd = object.value("leftEnd").toInt();
+            segment.rightEnd = object.value("rightEnd").toInt();
+            segment.adjustment = {object.value("stereoWindow").toInt(), object.value("vertical").toInt(),
+                                  object.value("zoomBalance").toDouble()};
+            if (segment.leftEnd > segment.leftStart && segment.rightEnd > segment.rightStart)
+                segments.push_back(segment);
+        }
+        refreshSegmentList();
         const QJsonObject crop = root.value("crop").toObject();
         cropLeft->setValue(crop.value("left").toInt(0));
         cropRight->setValue(crop.value("right").toInt(0));
@@ -817,9 +1385,16 @@ private:
         linkStepping->setChecked(interface.value("linkedStepping").toBool(false));
         previewMode->setCurrentIndex(qBound(0, interface.value("previewMode").toInt(0), previewMode->count() - 1));
         themeSelector->setCurrentIndex(qBound(0, interface.value("theme").toInt(0), themeSelector->count() - 1));
-        outputMode->setCurrentIndex(qBound(0, interface.value("outputMode").toInt(0), outputMode->count() - 1));
+        int savedOutputMode = interface.value("outputMode").toInt(0);
+        if (!interface.contains("swapOutputEyes") && savedOutputMode == 1) savedOutputMode = 3;
+        outputMode->setCurrentIndex(qBound(0, savedOutputMode, outputMode->count() - 1));
         audioSource->setCurrentIndex(qBound(0, interface.value("audioSource").toInt(0), audioSource->count() - 1));
+        swapOutputEyes->setChecked(interface.value("swapOutputEyes").toBool(false));
         colorReference->setCurrentIndex(qBound(0, interface.value("colorReference").toInt(0), colorReference->count() - 1));
+        const int stepLevel = qBound(0, interface.value("adjustmentStep").toInt(0), 2);
+        if (QAbstractButton *button = adjustmentStepGroup->button(stepLevel)) button->setChecked(true);
+        updateAdjustmentSteps();
+        showGrid->setChecked(interface.value("showGrid").toBool(false));
         projectPath = QFileInfo(path).absoluteFilePath();
         setWindowTitle("Stereo Aligner — " + QFileInfo(projectPath).completeBaseName());
         updateColorSummary();
@@ -855,6 +1430,10 @@ private:
         VideoInfo &target = left ? leftInfo : rightInfo;
         EyeControls &ui = left ? leftUi : rightUi;
         target = info;
+        segments.clear();
+        markedLeftStart = markedRightStart = -1;
+        if (segmentTable) segmentTable->setRowCount(0);
+        if (commonTimeline) commonTimeline->setSpans({});
         leftColor = ColorCorrection{};
         rightColor = ColorCorrection{};
         updateColorSummary();
@@ -869,6 +1448,7 @@ private:
         ui.frame->setValue(0);
         status->setText("Ready");
         updateReadyState();
+        updateCommonTimelineFromFrames();
         requestPreview();
     }
 
@@ -914,7 +1494,7 @@ private:
         const QList<QWidget*> rightWidgets {rightUi.previous, rightUi.next, rightUi.slider, rightUi.frame, rightUi.x, rightUi.y, rightUi.zoom};
         for (QWidget *w : leftWidgets) w->setEnabled(leftReady);
         for (QWidget *w : rightWidgets) w->setEnabled(rightReady);
-        exportButton->setEnabled(leftReady && rightReady && !exportProcess);
+        exportButton->setEnabled(leftReady && rightReady && !segments.empty() && !exportProcess);
         autoAlignButton->setEnabled(leftReady && rightReady && !exportProcess);
         autoCropButton->setEnabled(leftReady && rightReady && !exportProcess);
         autoColorButton->setEnabled(leftReady && rightReady && !exportProcess);
@@ -925,6 +1505,16 @@ private:
         for (QSpinBox *spin : {cropLeft, cropRight, cropTop, cropBottom})
             spin->setEnabled(leftReady && rightReady);
         resetAlignment->setEnabled(leftReady || rightReady);
+        const QList<QWidget*> centeredWidgets {stereoWindowSlider, verticalSlider, zoomBalanceSlider,
+                                               stereoWindowSpin, verticalSpin, zoomBalanceSpin,
+                                               markSegmentStartButton, addSegmentButton};
+        for (QWidget *widget : centeredWidgets)
+            widget->setEnabled(leftReady && rightReady && !exportProcess);
+        updateSegmentButton->setEnabled(leftReady && rightReady && selectedSegmentRow() >= 0 && !exportProcess);
+        removeSegmentButton->setEnabled(leftReady && rightReady && selectedSegmentRow() >= 0 && !exportProcess);
+        commonTimeline->setEnabled(leftReady && rightReady && !exportProcess);
+        timelineMarkStartButton->setEnabled(leftReady && rightReady && !exportProcess);
+        timelineAddEndButton->setEnabled(leftReady && rightReady && !exportProcess);
         updateSummary();
     }
 
@@ -1143,17 +1733,15 @@ private:
         box.exec();
         if (box.clickedButton() != applyAll && box.clickedButton() != zoomOnly) return;
 
-        // Split the relative scale between both eyes, like stereo alignment
-        // tools that adjust both sources rather than degrading only one side.
-        const double rootScale = std::sqrt(scale);
-        leftUi.zoom->setValue(qBound(25.0, 100.0 / rootScale, 400.0));
-        rightUi.zoom->setValue(qBound(25.0, 100.0 * rootScale, 400.0));
+        // Keep the stereo midpoint invariant.  The complementary zoom balance
+        // also preserves the measured right/left scale ratio exactly.
+        CenteredAdjustment adjustment = currentAdjustment();
+        adjustment.zoomBalance = qBound(-75.0, 100.0 * (scale - 1.0) / (scale + 1.0), 75.0);
         if (box.clickedButton() == applyAll) {
-            leftUi.x->setValue(qRound(-x / 2.0));
-            rightUi.x->setValue(qRound(x / 2.0));
-            leftUi.y->setValue(qRound(-y / 2.0));
-            rightUi.y->setValue(qRound(y / 2.0));
+            adjustment.stereoWindow = qRound(x / 2.0);
+            adjustment.vertical = qRound(y / 2.0);
         }
+        setCurrentAdjustment(adjustment);
         autoCropBorders();
         updateSummary();
         requestPreview();
@@ -1173,27 +1761,51 @@ private:
         return QRect(left, top, qMax(2, croppedWidth), qMax(2, croppedHeight));
     }
 
+    QRect safeCropForAdjustment(int width, int height, const CenteredAdjustment &adjustment) const
+    {
+        auto bounds = [width, height](int x, int y, double zoomPercent) {
+            const double zoom = zoomPercent / 100.0;
+            const int transformedWidth = qMax(2, qRound((width * zoom) / 2.0) * 2);
+            const int transformedHeight = qMax(2, qRound((height * zoom) / 2.0) * 2);
+            return QRect((width - transformedWidth) / 2 + x,
+                         (height - transformedHeight) / 2 + y,
+                         transformedWidth, transformedHeight);
+        };
+        const QRect leftBounds = bounds(-adjustment.stereoWindow, -adjustment.vertical,
+                                        100.0 - adjustment.zoomBalance);
+        const QRect rightBounds = bounds(adjustment.stereoWindow, adjustment.vertical,
+                                         100.0 + adjustment.zoomBalance);
+        const int x1 = qMax(0, qMax(leftBounds.x(), rightBounds.x()));
+        const int y1 = qMax(0, qMax(leftBounds.y(), rightBounds.y()));
+        int x2 = qMin(width, qMin(leftBounds.x() + leftBounds.width(), rightBounds.x() + rightBounds.width()));
+        int y2 = qMin(height, qMin(leftBounds.y() + leftBounds.height(), rightBounds.y() + rightBounds.height()));
+        if ((x2 - x1) % 2) --x2;
+        if ((y2 - y1) % 2) --y2;
+        return QRect(x1, y1, qMax(0, x2 - x1), qMax(0, y2 - y1));
+    }
+
+    QRect projectSafeCrop(int width, int height) const
+    {
+        QRect common(0, 0, width, height);
+        for (const FrameSegment &segment : segments)
+            common = common.intersected(safeCropForAdjustment(width, height, segment.adjustment));
+        int w = common.width();
+        int h = common.height();
+        if (w % 2) --w;
+        if (h % 2) --h;
+        return QRect(common.x(), common.y(), qMax(0, w), qMax(0, h));
+    }
+
     void autoCropBorders()
     {
         if (!leftInfo.valid() || !rightInfo.valid()) return;
         const int width = qMin(leftInfo.displayWidth, rightInfo.displayWidth);
         const int height = qMin(leftInfo.displayHeight, rightInfo.displayHeight);
-        auto transformedBounds = [width, height](const EyeControls &ui) {
-            const double zoom = ui.zoom->value() / 100.0;
-            const int transformedWidth = qMax(2, qRound((width * zoom) / 2.0) * 2);
-            const int transformedHeight = qMax(2, qRound((height * zoom) / 2.0) * 2);
-            const int x = (width - transformedWidth) / 2 + ui.x->value();
-            const int y = (height - transformedHeight) / 2 + ui.y->value();
-            return QRect(x, y, transformedWidth, transformedHeight);
-        };
-        const QRect leftBounds = transformedBounds(leftUi);
-        const QRect rightBounds = transformedBounds(rightUi);
-        const int commonLeft = qMax(0, qMax(leftBounds.left(), rightBounds.left()));
-        const int commonTop = qMax(0, qMax(leftBounds.top(), rightBounds.top()));
-        const int commonRight = qMin(width, qMin(leftBounds.x() + leftBounds.width(),
-                                                 rightBounds.x() + rightBounds.width()));
-        const int commonBottom = qMin(height, qMin(leftBounds.y() + leftBounds.height(),
-                                                   rightBounds.y() + rightBounds.height()));
+        const QRect safe = safeCropForAdjustment(width, height, currentAdjustment());
+        const int commonLeft = safe.x();
+        const int commonTop = safe.y();
+        const int commonRight = safe.x() + safe.width();
+        const int commonBottom = safe.y() + safe.height();
         if (commonRight - commonLeft < 2 || commonBottom - commonTop < 2) {
             QMessageBox::warning(this, "Cannot auto crop",
                                  "The transformed videos do not have a usable common image area.");
@@ -1370,6 +1982,28 @@ private:
         return result;
     }
 
+    static void overlayAlignmentGrid(QImage &image)
+    {
+        if (image.isNull()) return;
+        QPainter painter(&image);
+        painter.setRenderHint(QPainter::Antialiasing, false);
+        QPen minor(QColor(255, 255, 255, 95));
+        minor.setWidth(1);
+        painter.setPen(minor);
+        // A full 10 x 10 field is more useful for judging small stereo drift
+        // than the previous rule-of-thirds overlay.
+        for (int part = 1; part < 10; ++part) {
+            if (part == 5) continue;
+            painter.drawLine(image.width() * part / 10, 0, image.width() * part / 10, image.height() - 1);
+            painter.drawLine(0, image.height() * part / 10, image.width() - 1, image.height() * part / 10);
+        }
+        QPen center(QColor(0, 220, 255, 190));
+        center.setWidth(1);
+        painter.setPen(center);
+        painter.drawLine(image.width() / 2, 0, image.width() / 2, image.height() - 1);
+        painter.drawLine(0, image.height() / 2, image.width() - 1, image.height() / 2);
+    }
+
     void updatePreview()
     {
         if (!leftInfo.valid() && !rightInfo.valid()) return;
@@ -1384,6 +2018,8 @@ private:
         double scale = qMin(availableW / static_cast<double>(canvasW), availableH / static_cast<double>(canvasH));
         scale = qMin(scale, 1.0);
         const QSize canvas(qMax(2, qRound(canvasW * scale)), qMax(2, qRound(canvasH * scale)));
+        previewPixelsPerDisplayX = canvasW / static_cast<double>(canvas.width());
+        previewPixelsPerDisplayY = canvasH / static_cast<double>(canvas.height());
         const int decodeWidth = qMin(1600, qMax(2, canvas.width()));
         QImage leftRaw = extractFrame(leftInfo, leftUi.frame->value(), decodeWidth);
         QImage rightRaw = extractFrame(rightInfo, rightUi.frame->value(), decodeWidth);
@@ -1405,6 +2041,10 @@ private:
         if (previewMode->currentIndex() == 0) {
             // Keep portrait eyes as a compact centered pair instead of stretching
             // their labels across the full width of the window.
+            if (showGrid->isChecked()) {
+                overlayAlignmentGrid(left);
+                overlayAlignmentGrid(right);
+            }
             leftPreview->setFixedSize(croppedCanvas);
             rightPreview->setFixedSize(croppedCanvas);
             leftPreview->setPixmap(QPixmap::fromImage(left));
@@ -1429,6 +2069,7 @@ private:
                     }
                 }
             }
+            if (showGrid->isChecked()) overlayAlignmentGrid(combined);
             singlePreview->setPixmap(QPixmap::fromImage(combined));
         }
         QApplication::restoreOverrideCursor();
@@ -1443,17 +2084,20 @@ private:
         }
         const double lt = leftUi.frame->value() / leftInfo.fps;
         const double rt = rightUi.frame->value() / rightInfo.fps;
-        const double remaining = qMin(leftInfo.duration - lt, rightInfo.duration - rt);
+        double projectLength = 0.0;
+        for (const FrameSegment &segment : segments)
+            projectLength += qMin((segment.leftEnd - segment.leftStart + 1) / leftInfo.fps,
+                                  (segment.rightEnd - segment.rightStart + 1) / rightInfo.fps);
         const QString layout = QString("%1 preview").arg(
             leftInfo.displayHeight > leftInfo.displayWidth ? "Portrait" : "Landscape");
         const QRect crop = effectiveCropRect(qMin(leftInfo.displayWidth, rightInfo.displayWidth),
                                              qMin(leftInfo.displayHeight, rightInfo.displayHeight));
-        syncSummary->setText(QString("%1  •  L frame %2 @ %3, zoom %4%  •  R frame %5 @ %6, zoom %7%  •  Crop %8×%9  •  Offset R−L: %10 s  •  Export: %11")
+        syncSummary->setText(QString("%1  •  L frame %2 @ %3, zoom %4%  •  R frame %5 @ %6, zoom %7%  •  Crop %8×%9  •  Offset R−L: %10 s  •  Project: %11 ranges / %12")
             .arg(layout)
             .arg(leftUi.frame->value()).arg(secondsText(lt)).arg(leftUi.zoom->value(), 0, 'f', 1)
             .arg(rightUi.frame->value()).arg(secondsText(rt)).arg(rightUi.zoom->value(), 0, 'f', 1)
             .arg(crop.width()).arg(crop.height())
-            .arg(rt - lt, 0, 'f', 3).arg(secondsText(remaining)));
+            .arg(rt - lt, 0, 'f', 3).arg(static_cast<int>(segments.size())).arg(secondsText(projectLength)));
     }
 
     static QString ffmpegColorFilter(const ColorCorrection &correction)
@@ -1472,13 +2116,15 @@ private:
     void startExport()
     {
         if (!leftInfo.valid() || !rightInfo.valid() || exportProcess) return;
-        const double leftStart = leftUi.frame->value() / leftInfo.fps;
-        const double rightStart = rightUi.frame->value() / rightInfo.fps;
-        exportDuration = qMin(leftInfo.duration - leftStart, rightInfo.duration - rightStart);
-        if (exportDuration <= 0.05) {
-            QMessageBox::warning(this, "Nothing to export", "The selected frame pair is too close to the end of a video.");
+        if (segments.empty()) {
+            QMessageBox::information(this, "No project ranges",
+                                     "Add at least one frame range to the project before exporting.");
             return;
         }
+        exportDuration = 0.0;
+        for (const FrameSegment &segment : segments)
+            exportDuration += qMin((segment.leftEnd - segment.leftStart + 1) / leftInfo.fps,
+                                   (segment.rightEnd - segment.rightStart + 1) / rightInfo.fps);
         QString suggested = QFileInfo(leftInfo.path).dir().filePath(QFileInfo(leftInfo.path).completeBaseName() + "_StereoAligned.mp4");
         exportOutput = QFileDialog::getSaveFileName(this, "Export aligned stereo video", suggested, "MP4 video (*.mp4)");
         if (exportOutput.isEmpty()) return;
@@ -1486,9 +2132,15 @@ private:
 
         const int width = qMin(leftInfo.displayWidth, rightInfo.displayWidth);
         const int height = qMin(leftInfo.displayHeight, rightInfo.displayHeight);
-        const QRect crop = effectiveCropRect(width, height);
+        const QRect crop = projectSafeCrop(width, height);
+        if (crop.width() < 2 || crop.height() < 2) {
+            QMessageBox::warning(this, "No common image area",
+                                 "The project ranges do not share a usable black-border-free crop. Reduce the adjustments in the extreme range.");
+            return;
+        }
         const double fps = qMin(leftInfo.fps, rightInfo.fps);
-        auto eyeChain = [&](int input, double start, int x, int y, double zoomPercent, const QString &name) {
+        auto eyeChain = [&](int input, double start, double duration, int x, int y,
+                            double zoomPercent, const QString &name) {
             const double zoom = zoomPercent / 100.0;
             const int zoomWidth = qMax(2, qRound((width * zoom) / 2.0) * 2);
             const int zoomHeight = qMax(2, qRound((height * zoom) / 2.0) * 2);
@@ -1496,33 +2148,64 @@ private:
             const int centeredY = (height - zoomHeight) / 2 + y;
             const ColorCorrection &correction = input == 0 ? leftColor : rightColor;
             return QString("[%1:v]trim=start=%2:duration=%3,setpts=PTS-STARTPTS,scale=%4:%5%8,setsar=1,fps=%6[eye%7];")
-                .arg(input).arg(start, 0, 'f', 6).arg(exportDuration, 0, 'f', 6).arg(zoomWidth).arg(zoomHeight)
+                .arg(input).arg(start, 0, 'f', 6).arg(duration, 0, 'f', 6).arg(zoomWidth).arg(zoomHeight)
                 .arg(fps, 0, 'f', 6).arg(name).arg(ffmpegColorFilter(correction))
                 + QString("color=c=black:s=%1x%2:r=%3:d=%4[base%5];[base%5][eye%5]overlay=x=%6:y=%7:shortest=1[placed%5];"
                           "[placed%5]crop=%8:%9:%10:%11[%5]")
-                .arg(width).arg(height).arg(fps, 0, 'f', 6).arg(exportDuration, 0, 'f', 6).arg(name)
+                .arg(width).arg(height).arg(fps, 0, 'f', 6).arg(duration, 0, 'f', 6).arg(name)
                 .arg(centeredX).arg(centeredY).arg(crop.width()).arg(crop.height()).arg(crop.x()).arg(crop.y());
         };
-        QString filter = eyeChain(0, leftStart, leftUi.x->value(), leftUi.y->value(), leftUi.zoom->value(), "l") + ";"
-                       + eyeChain(1, rightStart, rightUi.x->value(), rightUi.y->value(), rightUi.zoom->value(), "r") + ";";
-        if (outputMode->currentIndex() == 0) filter += "[l][r]hstack[v]";
-        else if (outputMode->currentIndex() == 1) filter += QString("[l][r]hstack,scale=%1:%2[v]").arg(crop.width()).arg(crop.height());
-        else filter += "[l][r]hstack[sbs];[sbs]stereo3d=sbsl:arcd[v]";
-
-        bool mapAudio = false;
-        if (audioSource->currentIndex() == 0 && leftInfo.hasAudio) {
-            filter += QString(";[0:a]atrim=start=%1:duration=%2,asetpts=PTS-STARTPTS[a]").arg(leftStart, 0, 'f', 6).arg(exportDuration, 0, 'f', 6);
-            mapAudio = true;
-        } else if (audioSource->currentIndex() == 1 && rightInfo.hasAudio) {
-            filter += QString(";[1:a]atrim=start=%1:duration=%2,asetpts=PTS-STARTPTS[a]").arg(rightStart, 0, 'f', 6).arg(exportDuration, 0, 'f', 6);
-            mapAudio = true;
+        QStringList chains;
+        QStringList videoLabels;
+        QStringList audioLabels;
+        const int audioInput = audioSource->currentIndex() == 0 ? 0 : 1;
+        const bool mapAudio = (audioInput == 0 && leftInfo.hasAudio && audioSource->currentIndex() != 2) ||
+                              (audioInput == 1 && rightInfo.hasAudio && audioSource->currentIndex() != 2);
+        for (int i = 0; i < static_cast<int>(segments.size()); ++i) {
+            const FrameSegment &segment = segments[i];
+            const double leftStart = segment.leftStart / leftInfo.fps;
+            const double rightStart = segment.rightStart / rightInfo.fps;
+            const double duration = qMin((segment.leftEnd - segment.leftStart + 1) / leftInfo.fps,
+                                         (segment.rightEnd - segment.rightStart + 1) / rightInfo.fps);
+            const QString l = QString("l%1").arg(i);
+            const QString r = QString("r%1").arg(i);
+            const QString v = QString("v%1").arg(i);
+            chains << eyeChain(0, leftStart, duration, -segment.adjustment.stereoWindow,
+                               -segment.adjustment.vertical, 100.0 - segment.adjustment.zoomBalance, l);
+            chains << eyeChain(1, rightStart, duration, segment.adjustment.stereoWindow,
+                               segment.adjustment.vertical, 100.0 + segment.adjustment.zoomBalance, r);
+            const int mode = outputMode->currentIndex();
+            const bool reverseEyes = (mode == 1) != swapOutputEyes->isChecked();
+            const QString first = reverseEyes ? r : l;
+            const QString second = reverseEyes ? l : r;
+            if (mode == 0 || mode == 1)
+                chains << QString("[%1][%2]hstack[%3]").arg(first, second, v);
+            else if (mode == 3)
+                chains << QString("[%1][%2]hstack,scale=%3:%4[%5]").arg(first, second).arg(crop.width()).arg(crop.height()).arg(v);
+            else
+                chains << QString("[%1][%2]hstack[sbs%3];[sbs%3]stereo3d=sbsl:arcd[%4]").arg(first, second).arg(i).arg(v);
+            videoLabels << QString("[%1]").arg(v);
+            if (mapAudio) {
+                const double audioStart = audioInput == 0 ? leftStart : rightStart;
+                const QString a = QString("a%1").arg(i);
+                chains << QString("[%1:a]atrim=start=%2:duration=%3,asetpts=PTS-STARTPTS[%4]")
+                              .arg(audioInput).arg(audioStart, 0, 'f', 6).arg(duration, 0, 'f', 6).arg(a);
+                audioLabels << QString("[%1]").arg(a);
+            }
         }
+        if (segments.size() == 1) chains << "[v0]null[v]";
+        else chains << videoLabels.join("") + QString("concat=n=%1:v=1:a=0[v]").arg(segments.size());
+        if (mapAudio) {
+            if (segments.size() == 1) chains << "[a0]anull[a]";
+            else chains << audioLabels.join("") + QString("concat=n=%1:v=0:a=1[a]").arg(segments.size());
+        }
+        const QString filter = chains.join(';');
 
         QStringList args {"-progress", "pipe:1", "-y", "-i", leftInfo.path, "-i", rightInfo.path,
                           "-filter_complex", filter, "-map", "[v]"};
         if (mapAudio) args << "-map" << "[a]" << "-c:a" << "aac" << "-b:a" << "192k";
         args << "-c:v" << "libx264" << "-preset" << "fast" << "-crf" << "18" << "-pix_fmt" << "yuv420p"
-             << "-movflags" << "+faststart" << "-t" << QString::number(exportDuration, 'f', 6) << exportOutput;
+             << "-movflags" << "+faststart" << exportOutput;
 
         exportProcess = new QProcess(this);
         cancelRequested = false;
@@ -1557,7 +2240,7 @@ private:
         if (exportProcess) exportProcess->deleteLater();
         exportProcess = nullptr;
         cancelButton->setVisible(false);
-        exportButton->setEnabled(leftInfo.valid() && rightInfo.valid());
+        updateReadyState();
         if (cancelRequested) {
             status->setText("Export cancelled");
             progress->setValue(0);
