@@ -281,6 +281,7 @@ private:
     QComboBox *audioSource = nullptr;
     QPushButton *swapOutputEyes = nullptr;
     QCheckBox *linkStepping = nullptr;
+    QPushButton *newProjectButton = nullptr;
     QPushButton *openProjectButton = nullptr;
     QPushButton *saveProjectButton = nullptr;
     QPushButton *resetAlignment = nullptr;
@@ -515,10 +516,13 @@ private:
 
         auto *projectGroup = new QGroupBox("Project");
         auto *projectLayout = new QHBoxLayout(projectGroup);
+        newProjectButton = new QPushButton("New");
         openProjectButton = new QPushButton("Open JSON…");
         saveProjectButton = new QPushButton("Save JSON…");
+        newProjectButton->setToolTip("Close the current work and reset an empty project.");
         openProjectButton->setToolTip("Open a saved Stereo Aligner project.");
         saveProjectButton->setToolTip("Save video paths and all current alignment settings as JSON.");
+        projectLayout->addWidget(newProjectButton);
         projectLayout->addWidget(openProjectButton);
         projectLayout->addWidget(saveProjectButton);
         drawerLayout->addWidget(projectGroup);
@@ -711,6 +715,7 @@ private:
         drawerAction->setToolTip("Show or hide controls");
         rail->addAction(drawerAction);
         rail->addSeparator();
+        QAction *newProjectAction = rail->addAction(style()->standardIcon(QStyle::SP_FileIcon), "New project");
         QAction *openProjectAction = rail->addAction(style()->standardIcon(QStyle::SP_DialogOpenButton), "Open JSON project");
         QAction *saveProjectAction = rail->addAction(style()->standardIcon(QStyle::SP_DialogSaveButton), "Save JSON project");
         rail->addSeparator();
@@ -720,6 +725,7 @@ private:
         QAction *exportAction = rail->addAction(style()->standardIcon(QStyle::SP_DialogSaveButton), "Export aligned video");
         connect(openLeftAction, &QAction::triggered, this, [this] { chooseVideo(true); });
         connect(openRightAction, &QAction::triggered, this, [this] { chooseVideo(false); });
+        connect(newProjectAction, &QAction::triggered, this, [this] { newProject(); });
         connect(openProjectAction, &QAction::triggered, this, [this] { openProject(); });
         connect(saveProjectAction, &QAction::triggered, this, [this] { saveProject(); });
         connect(exportAction, &QAction::triggered, this, [this] { startExport(); });
@@ -992,6 +998,7 @@ private:
 
     void connectUi()
     {
+        connect(newProjectButton, &QPushButton::clicked, this, [this] { newProject(); });
         connect(openProjectButton, &QPushButton::clicked, this, [this] { openProject(); });
         connect(saveProjectButton, &QPushButton::clicked, this, [this] { saveProject(); });
         connect(leftUi.open, &QPushButton::clicked, this, [this] { chooseVideo(true); });
@@ -1127,6 +1134,7 @@ private:
         addShortcut(QKeySequence(Qt::Key_D), [this] { stepFrame(true, 1, false); });
         addShortcut(QKeySequence(Qt::Key_J), [this] { stepFrame(false, -1, false); });
         addShortcut(QKeySequence(Qt::Key_L), [this] { stepFrame(false, 1, false); });
+        addShortcut(QKeySequence::New, [this] { newProject(); });
         addShortcut(QKeySequence::Open, [this] { openProject(); });
         addShortcut(QKeySequence::Save, [this] { saveProject(); });
         addAlignmentShortcuts();
@@ -1236,12 +1244,93 @@ private:
         return array;
     }
 
-    void saveProject()
+    void newProject()
+    {
+        if (exportProcess) {
+            QMessageBox::information(this, "Export in progress",
+                                     "Finish or cancel the current export before starting a new project.");
+            return;
+        }
+        const bool hasCurrentProject = leftInfo.valid() || rightInfo.valid() ||
+                                       !segments.empty() || !projectPath.isEmpty();
+        if (hasCurrentProject) {
+            QMessageBox prompt(this);
+            prompt.setWindowTitle("Start a new project?");
+            prompt.setIcon(QMessageBox::Question);
+            prompt.setText("Do you want to save the current project before starting a new one?");
+            prompt.setInformativeText("Unsaved ranges and adjustments will be lost if you choose Discard.");
+            prompt.setStandardButtons(QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel);
+            prompt.setDefaultButton(QMessageBox::Save);
+            const int choice = prompt.exec();
+            if (choice == QMessageBox::Cancel) return;
+            if (choice == QMessageBox::Save && !saveProject()) return;
+        }
+
+        previewTimer.stop();
+        leftInfo = VideoInfo{};
+        rightInfo = VideoInfo{};
+        projectPath.clear();
+        segments.clear();
+        markedLeftStart = markedRightStart = -1;
+        commonSyncOffsetSeconds = 0.0;
+
+        auto resetEye = [](EyeControls &ui) {
+            ui.fileName->setText("No video loaded");
+            ui.fileName->setToolTip({});
+            ui.details->setText("—");
+            ui.slider->setRange(0, 0);
+            ui.slider->setValue(0);
+            ui.frame->setRange(0, 0);
+            ui.frame->setValue(0);
+        };
+        resetEye(leftUi);
+        resetEye(rightUi);
+        setCurrentAdjustment({});
+        cropLeft->setValue(0); cropRight->setValue(0);
+        cropTop->setValue(0); cropBottom->setValue(0);
+        leftColor = ColorCorrection{};
+        rightColor = ColorCorrection{};
+        updateColorSummary();
+
+        linkStepping->setChecked(false);
+        previewMode->setCurrentIndex(0);
+        outputMode->setCurrentIndex(0);
+        audioSource->setCurrentIndex(0);
+        swapOutputEyes->setChecked(false);
+        colorReference->setCurrentIndex(0);
+        if (QAbstractButton *fine = adjustmentStepGroup->button(0)) fine->setChecked(true);
+        updateAdjustmentSteps();
+        showGrid->setChecked(false);
+
+        segmentTable->setRowCount(0);
+        commonTimeline->setSpans({});
+        commonTimeline->setPendingStart(-1);
+        commonTimeline->setRange(0, 0);
+        commonTimeline->setValue(0);
+        commonTimelinePosition->setText(secondsText(0.0));
+        progress->setValue(0);
+
+        auto resetPreview = [](QLabel *label, const QString &name) {
+            label->clear();
+            label->setText(name + "\n\nLoad a video");
+            label->setMinimumSize(0, 250);
+            label->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+        };
+        resetPreview(leftPreview, "LEFT");
+        resetPreview(rightPreview, "RIGHT");
+        resetPreview(singlePreview, "PREVIEW");
+
+        setWindowTitle("Stereo Aligner");
+        status->setText(ffmpegPath.isEmpty() ? "FFmpeg not found" : "New project ready");
+        updateReadyState();
+    }
+
+    bool saveProject()
     {
         if (!leftInfo.valid() || !rightInfo.valid()) {
             QMessageBox::information(this, "Load both videos",
                                      "Load both the left and right videos before saving a project.");
-            return;
+            return false;
         }
         QString suggested;
         if (!projectPath.isEmpty()) suggested = projectPath;
@@ -1249,7 +1338,7 @@ private:
             QFileInfo(leftInfo.path).completeBaseName() + "_StereoAligner.json");
         QString path = QFileDialog::getSaveFileName(this, "Save Stereo Aligner project", suggested,
                                                     "Stereo Aligner project (*.json)");
-        if (path.isEmpty()) return;
+        if (path.isEmpty()) return false;
         if (QFileInfo(path).suffix().isEmpty()) path += ".json";
         const QDir projectDirectory = QFileInfo(path).absoluteDir();
         QJsonObject root {
@@ -1282,11 +1371,12 @@ private:
             file.write(QJsonDocument(root).toJson(QJsonDocument::Indented)) < 0 || !file.commit()) {
             QMessageBox::critical(this, "Could not save project",
                                   "The project file could not be written:\n" + QDir::toNativeSeparators(path));
-            return;
+            return false;
         }
         projectPath = QFileInfo(path).absoluteFilePath();
         setWindowTitle("Stereo Aligner — " + QFileInfo(projectPath).completeBaseName());
         status->setText("Project saved: " + QFileInfo(projectPath).fileName());
+        return true;
     }
 
     void restoreEye(const QJsonObject &eye, EyeControls &ui, ColorCorrection &color)
@@ -1494,6 +1584,7 @@ private:
         const QList<QWidget*> rightWidgets {rightUi.previous, rightUi.next, rightUi.slider, rightUi.frame, rightUi.x, rightUi.y, rightUi.zoom};
         for (QWidget *w : leftWidgets) w->setEnabled(leftReady);
         for (QWidget *w : rightWidgets) w->setEnabled(rightReady);
+        newProjectButton->setEnabled(!exportProcess);
         exportButton->setEnabled(leftReady && rightReady && !segments.empty() && !exportProcess);
         autoAlignButton->setEnabled(leftReady && rightReady && !exportProcess);
         autoCropButton->setEnabled(leftReady && rightReady && !exportProcess);

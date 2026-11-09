@@ -21,6 +21,7 @@ Stereo Aligner is a Qt 6 Widgets application for synchronizing and aligning two 
 - Shared synchronized timeline beneath the previews, with a gold pending-start marker and a different colored band for every project range.
 - Editable range table with automatic `Range 1`, `Range 2`, … names and paired From/To frame columns.
 - Save and reopen portable JSON projects containing both video paths, frame ranges, transforms, crop, color correction and interface/output choices.
+- Start a clean project with **New** (`Ctrl+N`); an existing project receives a Save, Discard, or Cancel prompt before it is reset.
 - Side-by-side, red/cyan anaglyph, and difference previews.
 - Light and dark themes, with light selected by default.
 - English/US number formatting independent of Windows regional settings.
